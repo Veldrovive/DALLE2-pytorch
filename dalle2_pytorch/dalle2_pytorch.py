@@ -1184,7 +1184,9 @@ class Decoder(BaseGaussianDiffusion):
         self,
         unet,
         *,
-        clip,
+        clip = None,
+        clip_image_size = None,                    # If clip is not specified, clip_image_size and clip_channels must be passed in explicitly
+        clip_channels = None,
         vae = tuple(),
         timesteps = 1000,
         cond_drop_prob = 0.2,
@@ -1205,11 +1207,16 @@ class Decoder(BaseGaussianDiffusion):
             loss_type = loss_type
         )
 
-        assert isinstance(clip, CLIP)
-        freeze_model_and_make_eval_(clip)
-        self.clip = clip
-        self.clip_image_size = clip.image_size
-        self.channels = clip.image_channels
+        if clip is not None:
+            assert isinstance(clip, CLIP)
+            freeze_model_and_make_eval_(clip)
+            self.clip = clip
+            self.clip_image_size = clip.image_size
+            self.channels = clip.image_channels
+        else:
+            self.clip = None
+            self.clip_image_size = clip_image_size
+            self.channels = clip_channels
 
         self.condition_on_text_encodings = condition_on_text_encodings
 
@@ -1289,11 +1296,13 @@ class Decoder(BaseGaussianDiffusion):
 
     @torch.no_grad()
     def get_text_encodings(self, text):
+        assert self.clip is not None, "Text encodings cannot be generated without a clip model in the decoder"
         text_encodings = self.clip.text_transformer(text)
         return text_encodings[:, 1:]
 
     @torch.no_grad()
     def get_image_embed(self, image):
+        assert self.clip is not None, "Image embeddings cannot be generated without a clip model in the decoder"
         image = resize_image_to(image, self.clip_image_size)
         image_encoding = self.clip.visual_transformer(image)
         image_cls = image_encoding[:, 0]
