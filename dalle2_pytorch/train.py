@@ -76,7 +76,21 @@ class EMA(nn.Module):
         def calculate_ema(beta, old, new):
             if not exists(old):
                 return new
-            return old * beta + (1 - beta) * new
+            try:
+                return old * beta + (1 - beta) * new
+            except RuntimeError as e:
+                print(e)
+                print(beta)
+                try:
+                    print("Old", old, old.get_device())
+                except RuntimeError:
+                    print("Old is on cpu", old)
+                try:
+                    print("New", new, new.get_device())
+                except RuntimeError:
+                    print("New is on cpu", new)
+                raise e
+                
 
         for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
             old_weight, up_weight = ma_params.data, current_params.data
@@ -219,6 +233,27 @@ class DecoderTrainer(nn.Module):
         # gradient clipping if needed
 
         self.max_grad_norm = max_grad_norm
+    
+    def state_dict(self):
+        """
+        Returns a dict with:
+        model: the decoder state dict
+        optimizers: And array of state dicts for each optimizer
+        scalers: And array of state dicts for each scaler
+        """
+        model_state = self.decoder.state_dict()
+        optimizers_state = []
+        scalers_state = []
+        for ind in range(self.num_unets):
+            optimizer = getattr(self, f'optim{ind}')
+            scaler = getattr(self, f'scaler{ind}')
+            optimizers_state.append(optimizer.state_dict())
+            scalers_state.append(scaler.state_dict())
+        return {
+            'model': model_state,
+            'optimizers': optimizers_state,
+            'scalers': scalers_state
+        }
 
     @property
     def unets(self):

@@ -1252,6 +1252,7 @@ class Unet(nn.Module):
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
+        self.in_out = in_out
 
         # time, image embeddings, and optional text encoding
 
