@@ -410,6 +410,21 @@ class DecoderTrainer(nn.Module):
 
         self.register_buffer('step', torch.tensor([0.]))
 
+    def state_dict(self, **kwargs):
+        trainer_state_dict = super().state_dict(**kwargs)
+        state_dict = {}
+        state_dict["trainer"] = trainer_state_dict
+        for index in range(self.num_unets):
+            state_dict[f'optim{index}'] = getattr(self, f'optim{index}').state_dict()
+            state_dict[f'scaler{index}'] = getattr(self, f'scaler{index}').state_dict()
+        return state_dict
+
+    def load_state_dict(self, state_dict, **kwargs):
+        super().load_state_dict(state_dict["trainer"], **kwargs)
+        for index in range(self.num_unets):
+            getattr(self, f'optim{index}').load_state_dict(state_dict[f'optim{index}'])
+            getattr(self, f'scaler{index}').load_state_dict(state_dict[f'scaler{index}'])
+
     @property
     def unets(self):
         return nn.ModuleList([ema.ema_model for ema in self.ema_unets])
