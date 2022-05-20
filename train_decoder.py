@@ -102,37 +102,48 @@ def get_dataset_keys(dataloader):
         dataloader = dataloader.pipeline[0]
     return dataloader.dataset.key_map
 
-def generate_samples(trainer, dataloader, device, n=5, text_prepend=""):
+def get_example_data(dataloader, device, n=5):
     """
-    Generates n samples from the decoder and uploads them to wandb
-    Consistently uses the first n image embeddings from the dataloader
-    If the dataloader returns an extra text key, that is used as the caption
+    Samples the dataloader and returns a zipped list of examples
     """
-    test_iter = iter(dataloader)
-    real_images = []
-    generated_images = []
+    images = []
+    embeddings = []
     captions = []
     dataset_keys = get_dataset_keys(dataloader)
     has_caption = "txt" in dataset_keys
-    with torch.no_grad():
-        for data in test_iter:
-            if has_caption:
-                img, emb, txt = data
-            else:
-                img, emb = data
-                txt = [""] * emb.shape[0]
-            img = img.to(device=device, dtype=torch.float)
-            emb = emb.to(device=device, dtype=torch.float)
-            sample = trainer.sample(emb)
-            real_images.extend(list(img))
-            generated_images.extend(list(sample))
-            captions.extend([text_prepend + t for t in txt])
-            if len(real_images) >= n:
-                break
-    return real_images[:n], generated_images[:n], captions[:n]
+    for data in dataloader:
+        if has_caption:
+            img, emb, txt = data
+        else:
+            img, emb = data
+            txt = [""] * emb.shape[0]
+        img = img.to(device=device, dtype=torch.float)
+        emb = emb.to(device=device, dtype=torch.float)
+        images.extend(list(img))
+        embeddings.extend(list(emb))
+        captions.extend(list(txt))
+        if len(images) >= n:
+            break
+    print("Generated {} examples".format(len(images)))
+    return list(zip(images[:n], embeddings[:n], captions[:n]))
 
-def generate_grid_samples(trainer, dataloader, device, n=5, text_prepend=""):
-    real_images, generated_images, captions = generate_samples(trainer, dataloader, device, n, text_prepend)
+def generate_samples(trainer, example_data, text_prepend=""):
+    """
+    Takes example data and generates images from the embeddings
+    Returns three lists: real images, generated images, and captions
+    """
+    real_images, embeddings, txts = zip(*example_data)
+    embeddings_tensor = torch.stack(embeddings)
+    samples = trainer.sample(embeddings_tensor)
+    generated_images = list(samples)
+    captions = [text_prepend + txt for txt in txts]
+    return real_images, generated_images, captions
+
+def generate_grid_samples(trainer, examples, text_prepend=""):
+    """
+    Generates samples and uses torchvision to put them in a side by side grid for easy viewing
+    """
+    real_images, generated_images, captions = generate_samples(trainer, examples, text_prepend)
     grid_images = [torchvision.utils.make_grid([original_image, generated_image]) for original_image, generated_image in zip(real_images, generated_images)]
     return grid_images, captions
                     
@@ -142,7 +153,8 @@ def evaluate_trainer(trainer, dataloader, device, n_evalation_samples=1000, FID=
     """
     metrics = {}
     # Prepare the data
-    real_images, generated_images, captions = generate_samples(trainer, dataloader, device, n_evalation_samples)
+    examples = get_example_data(dataloader, device, n_evalation_samples)
+    real_images, generated_images, captions = generate_samples(trainer, examples)
     real_images = torch.stack(real_images).to(device=device, dtype=torch.float)
     generated_images = torch.stack(generated_images).to(device=device, dtype=torch.float)
     # Convert from [0, 1] to [0, 255] and from torch.float to torch.uint8
@@ -200,6 +212,7 @@ def recall_trainer(tracker, trainer, recall_source=None, **load_config):
     print(print_ribbon(f"Loading model from {recall_source}"))
     state_dict = tracker.recall_state_dict(recall_source, **load_config)
     trainer.load_state_dict(state_dict["trainer"])
+    print("Model loaded")
     return state_dict["epoch"], state_dict["step"], state_dict["validation_losses"]
 
 def train(
@@ -240,6 +253,11 @@ def train(
         # Then the unet mask should be true for all unets in the decoder
         unet_training_mask = [True] * trainer.num_unets
     assert len(unet_training_mask) == trainer.num_unets, f"The unet training mask should be the same length as the number of unets in the decoder. Got {len(unet_training_mask)} and {trainer.num_unets}"
+
+    print(print_ribbon("Generating Example Data", repeat=40))
+    print("This can take a while to load the shard lists...")
+    train_example_data = get_example_data(dataloaders["train_sampling"], inference_device, n_sample_images)
+    test_example_data = get_example_data(dataloaders["test_sampling"], inference_device, n_sample_images)
     
     send_to_device = lambda arr: [x.to(device=inference_device, dtype=torch.float) for x in arr]
     step = start_step
@@ -291,9 +309,8 @@ def train(
                 save_trainer(tracker, trainer, epoch, step, validation_losses, save_paths)
                 if n_sample_images is not None and n_sample_images > 0:
                     trainer.eval()
-                    train_images, train_captions = generate_grid_samples(trainer, dataloaders["train_sampling"], inference_device, n=n_sample_images, text_prepend="Train: ")
+                    train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
                     trainer.train()
-                    log_images(tracker, train_images, train_captions, "Train Samples", step=step)
                     tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step)
 
             if epoch_samples is not None and sample >= epoch_samples:
@@ -322,9 +339,7 @@ def train(
                     break
             average_loss /= i+1
             log_data = {
-                "Validation loss": average_loss,
-                "Epoch": epoch,
-                "Sample": sample
+                "Validation loss": average_loss
             }
             tracker.log(log_data, step=step, verbose=True)
 
@@ -337,8 +352,8 @@ def train(
 
         # Generate sample images
         print(print_ribbon(f"Sampling Set {epoch}", repeat=40))
-        test_images, test_captions = generate_grid_samples(trainer, dataloaders["test_sampling"], inference_device, n=n_sample_images, text_prepend="Test: ")
-        train_images, train_captions = generate_grid_samples(trainer, dataloaders["train_sampling"], inference_device, n=n_sample_images, text_prepend="Train: ")
+        test_images, test_captions = generate_grid_samples(trainer, test_example_data, "Test: ")
+        train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
         tracker.log_images(test_images, captions=test_captions, image_section="Test Samples", step=step)
         tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step)
 
