@@ -3,7 +3,6 @@
         {
             "dim": 128,
             "image_embed_dim": 768,
-            "cond_dim": 64,
             "channels": 3,
             "dim_mults": [1, 2, 4, 8],
             "attn_dim_head": 32,

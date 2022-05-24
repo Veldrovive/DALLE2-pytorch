@@ -13,6 +13,9 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
 from torchmetrics.image.kid import KernelInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
 import webdataset as wds
 import click
 
@@ -231,11 +234,22 @@ def train(
     save_latest=True,
     save_best=True,
     unet_training_mask=None,
+    rank=None,
     **kwargs
 ):
     """
     Trains a decoder on a dataset.
     """
+    is_master = rank is None or rank == 0
+    def if_master(func):
+        """
+        Decorator to only run a function if this is the master process
+        """
+        def wrapper(*args, **kwargs):
+            if is_master:
+                return func(*args, **kwargs)
+        return wrapper
+    
     trainer = DecoderTrainer(  # TODO: Change the get_optimizer function so that it can take arbitrary named args so we can just put **kwargs as an argument here
         decoder,
         **kwargs
@@ -254,15 +268,16 @@ def train(
         unet_training_mask = [True] * trainer.num_unets
     assert len(unet_training_mask) == trainer.num_unets, f"The unet training mask should be the same length as the number of unets in the decoder. Got {len(unet_training_mask)} and {trainer.num_unets}"
 
-    print(print_ribbon("Generating Example Data", repeat=40))
-    print("This can take a while to load the shard lists...")
-    train_example_data = get_example_data(dataloaders["train_sampling"], inference_device, n_sample_images)
-    test_example_data = get_example_data(dataloaders["test_sampling"], inference_device, n_sample_images)
+    if_master(print)(print_ribbon("Generating Example Data", repeat=40))
+    if_master(print)("This can take a while to load the shard lists...")
+    if is_master:
+        train_example_data = get_example_data(dataloaders["train_sampling"], inference_device, n_sample_images)
+        test_example_data = get_example_data(dataloaders["test_sampling"], inference_device, n_sample_images)
     
     send_to_device = lambda arr: [x.to(device=inference_device, dtype=torch.float) for x in arr]
     step = start_step
     for epoch in range(start_epoch, epochs):
-        print(print_ribbon(f"Starting epoch {epoch}", repeat=40))
+        if_master(print)(print_ribbon(f"Starting epoch {epoch}", repeat=40))
         trainer.train()
 
         sample = 0
@@ -286,7 +301,7 @@ def train(
             last_time = time.time()
             last_sample = sample
 
-            if i % 10 == 0:
+            if is_master and i % 10 == 0:
                 average_loss = sum(losses) / len(losses)
                 log_data = {
                     "Training loss": average_loss,
@@ -298,7 +313,7 @@ def train(
                 tracker.log(log_data, step=step, verbose=True)
                 losses = []
 
-            if last_snapshot + save_every_n_samples < sample:  # This will miss by some amount every time, but it's not a big deal... I hope
+            if is_master and last_snapshot + save_every_n_samples < sample:  # This will miss by some amount every time, but it's not a big deal... I hope
                 last_snapshot = sample
                 # We need to know where the model should be saved
                 save_paths = []
@@ -316,56 +331,57 @@ def train(
             if epoch_samples is not None and sample >= epoch_samples:
                 break
 
-        trainer.eval()
-        print(print_ribbon(f"Starting Validation {epoch}", repeat=40))
-        with torch.no_grad():
-            sample = 0
-            average_loss = 0
-            start_time = time.time()
-            for i, (img, emb, txt) in enumerate(dataloaders["val"]):
-                sample += img.shape[0]
-                img, emb = send_to_device((img, emb))
-                
-                for unet in range(1, len(decoder.unets)+1):
-                    loss = trainer.forward(img.float(), image_embed=emb.float(), unet_number=unet)
-                    average_loss += loss
+        if is_master:
+            trainer.eval()
+            print(print_ribbon(f"Starting Validation {epoch}", repeat=40))
+            with torch.no_grad():
+                sample = 0
+                average_loss = 0
+                start_time = time.time()
+                for i, (img, emb, txt) in enumerate(dataloaders["val"]):
+                    sample += img.shape[0]
+                    img, emb = send_to_device((img, emb))
+                    
+                    for unet in range(1, len(decoder.unets)+1):
+                        loss = trainer.forward(img.float(), image_embed=emb.float(), unet_number=unet)
+                        average_loss += loss
 
-                if i % 10 == 0:
-                    print(f"Epoch {epoch}/{epochs} - {sample / (time.time() - start_time):.2f} samples/sec")
-                    print(f"Loss: {average_loss / (i+1)}")
-                    print("")
+                    if i % 10 == 0:
+                        print(f"Epoch {epoch}/{epochs} - {sample / (time.time() - start_time):.2f} samples/sec")
+                        print(f"Loss: {average_loss / (i+1)}")
+                        print("")
 
-                if validation_samples is not None and sample >= validation_samples:
-                    break
-            average_loss /= i+1
-            log_data = {
-                "Validation loss": average_loss
-            }
-            tracker.log(log_data, step=step, verbose=True)
+                    if validation_samples is not None and sample >= validation_samples:
+                        break
+                average_loss /= i+1
+                log_data = {
+                    "Validation loss": average_loss
+                }
+                tracker.log(log_data, step=step, verbose=True)
 
-        # Compute evaluation metrics
-        trainer.eval()
-        if evaluate_config is not None:
-            print(print_ribbon(f"Starting Evaluation {epoch}", repeat=40))
-            evaluation = evaluate_trainer(trainer, dataloaders["val"], inference_device, **evaluate_config)
-            tracker.log(evaluation, step=step, verbose=True)
+            # Compute evaluation metrics
+            trainer.eval()
+            if evaluate_config is not None:
+                print(print_ribbon(f"Starting Evaluation {epoch}", repeat=40))
+                evaluation = evaluate_trainer(trainer, dataloaders["val"], inference_device, **evaluate_config)
+                tracker.log(evaluation, step=step, verbose=True)
 
-        # Generate sample images
-        print(print_ribbon(f"Sampling Set {epoch}", repeat=40))
-        test_images, test_captions = generate_grid_samples(trainer, test_example_data, "Test: ")
-        train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
-        tracker.log_images(test_images, captions=test_captions, image_section="Test Samples", step=step)
-        tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step)
+            # Generate sample images
+            print(print_ribbon(f"Sampling Set {epoch}", repeat=40))
+            test_images, test_captions = generate_grid_samples(trainer, test_example_data, "Test: ")
+            train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
+            tracker.log_images(test_images, captions=test_captions, image_section="Test Samples", step=step)
+            tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step)
 
-        print(print_ribbon(f"Starting Saving {epoch}", repeat=40))
-        # Get the same paths
-        save_paths = []
-        if save_latest:
-            save_paths.append("latest.pth")
-        if save_best and (len(validation_losses) == 0 or average_loss < min(validation_losses)):
-            save_paths.append("best.pth")
-        validation_losses.append(average_loss)
-        save_trainer(tracker, trainer, epoch, step, validation_losses, save_paths)
+            print(print_ribbon(f"Starting Saving {epoch}", repeat=40))
+            # Get the same paths
+            save_paths = []
+            if save_latest:
+                save_paths.append("latest.pth")
+            if save_best and (len(validation_losses) == 0 or average_loss < min(validation_losses)):
+                save_paths.append("best.pth")
+            validation_losses.append(average_loss)
+            save_trainer(tracker, trainer, epoch, step, validation_losses, save_paths)
 
 def create_tracker(config, tracker_type=None, data_path=None, **kwargs):
     """
@@ -426,9 +442,57 @@ def initialize_training(config):
     )
 
 
+def initialize_distributed_training(config):
+    world_size = 1
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    config["world_size"] = world_size
+    print(print_ribbon("Distributed Training", repeat=40))
+    mp.spawn(train_distributed, nprocs=world_size, args=(config,))
+
+def train_distributed(rank, config):
+    print(f"Starting Rank {rank}")
+    devices = ["cuda:5", "cuda:6"]
+    device = torch.device(devices[rank])
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend='nccl', init_method='env://', world_size=config["world_size"], rank=rank)
+    print(f"Creating rank {rank} decoder on device {device}")
+    decoder = create_decoder(device, config["decoder"], config["unets"])
+    print(f"Creating ddp model on rank {rank}")
+    # TODO: This clearly doesn't work. Try ddping the unets and modify the decoder such it can handle the module being ddp
+    # Also might need to put them in separate process groups since they share weight names
+    # Also check the state dict names and see if there is a prepended "module." which signifies the weight is ddp
+    ddp_decoder = DDP(decoder, device_ids=[device])
+    print(f"Creating trainer on rank {rank}")
+    # Divide the data into chunks for each rank
+    all_shards = list(range(config["data"]["start_shard"], config["data"]["end_shard"] + 1))
+    chunk_size = len(all_shards) // config["world_size"]
+    my_shards = all_shards[rank * chunk_size : (rank + 1) * chunk_size]
+    print(f"Rank {rank} has shards {len(my_shards)}")
+    dataloaders = create_dataloaders (
+        available_shards=my_shards,
+        img_preproc = config.get_preprocessing(),
+        train_prop = config["data"]["splits"]["train"],
+        val_prop = config["data"]["splits"]["val"],
+        test_prop = config["data"]["splits"]["test"],
+        n_sample_images=config["train"]["n_sample_images"],
+        **config["data"]
+    )
+    tracker = create_tracker(config, **config["tracker"]) if rank == 0 else None
+    print(f"Starting training for rank {rank}")
+    train(dataloaders, ddp_decoder, 
+        tracker=tracker,
+        inference_device=device,
+        load_config=config["load"],
+        evaluate_config=config["evaluate"],
+        **config["train"],
+        rank=rank
+    )
+
 class TrainDecoderConfig:
     def __init__(self, config):
         self.config = self.map_config(config, default_config)
+        self.extra_config = {}
 
     def map_config(self, config, defaults):
         """
@@ -484,7 +548,12 @@ class TrainDecoderConfig:
         return T.Compose(transformations)
     
     def __getitem__(self, key):
+        if key in self.extra_config:
+            return self.extra_config[key]
         return self.config[key]
+
+    def __setitem__(self, key, value):
+        self.extra_config[key] = value
 
 # Create a simple click command line interface to load the config and start the training
 @click.command()
@@ -494,7 +563,10 @@ def main(config_file):
     with open(config_file) as f:
         config = json.load(f)
     config = TrainDecoderConfig(config)
-    initialize_training(config)
+    if config["train"]["distributed"]:
+        initialize_distributed_training(config)
+    else:
+        initialize_training(config)
 
 
 if __name__ == "__main__":

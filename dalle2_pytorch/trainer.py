@@ -7,6 +7,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 from torch.cuda.amp import autocast, GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dalle2_pytorch.dalle2_pytorch import Decoder, DiffusionPrior
 from dalle2_pytorch.optimizer import get_optimizer
@@ -371,7 +372,9 @@ class DecoderTrainer(nn.Module):
         **kwargs
     ):
         super().__init__()
-        assert isinstance(decoder, Decoder)
+        assert isinstance(decoder, Decoder) or isinstance(decoder, DDP)
+        if isinstance(decoder, DDP):
+            decoder = decoder.module
         ema_kwargs, kwargs = groupby_prefix_and_trim('ema_', kwargs)
 
         self.decoder = decoder
