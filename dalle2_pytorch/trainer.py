@@ -361,6 +361,7 @@ def decoder_sample_in_chunks(fn):
 class DecoderTrainer(nn.Module):
     def __init__(
         self,
+        accelerator,
         decoder,
         use_ema = True,
         lr = 1e-4,
@@ -374,8 +375,9 @@ class DecoderTrainer(nn.Module):
         assert isinstance(decoder, Decoder)
         ema_kwargs, kwargs = groupby_prefix_and_trim('ema_', kwargs)
 
-        self.decoder = decoder
-        self.num_unets = len(self.decoder.unets)
+        self.accelerator = accelerator
+
+        self.num_unets = len(decoder.unets)
 
         self.use_ema = use_ema
         self.ema_unets = nn.ModuleList([])
@@ -387,7 +389,10 @@ class DecoderTrainer(nn.Module):
 
         lr, wd, eps = map(partial(cast_tuple, length = self.num_unets), (lr, wd, eps))
 
-        for ind, (unet, unet_lr, unet_wd, unet_eps) in enumerate(zip(self.decoder.unets, lr, wd, eps)):
+        optimizers = []
+        scalers = []
+
+        for ind, (unet, unet_lr, unet_wd, unet_eps) in enumerate(zip(decoder.unets, lr, wd, eps)):
             optimizer = get_optimizer(
                 unet.parameters(),
                 lr = unet_lr,
@@ -396,19 +401,28 @@ class DecoderTrainer(nn.Module):
                 **kwargs
             )
 
-            setattr(self, f'optim{ind}', optimizer) # cannot use pytorch ModuleList for some reason with optimizers
+            # setattr(self, f'optim{ind}', optimizer) # cannot use pytorch ModuleList for some reason with optimizers
+            optimizers.append(optimizer)
 
             if self.use_ema:
                 self.ema_unets.append(EMA(unet, **ema_kwargs))
 
             scaler = GradScaler(enabled = amp)
-            setattr(self, f'scaler{ind}', scaler)
+            # setattr(self, f'scaler{ind}', scaler)
+            scalers.append(scaler)
 
         # gradient clipping if needed
 
         self.max_grad_norm = max_grad_norm
 
         self.register_buffer('step', torch.tensor([0.]))
+
+        results = list(self.accelerator.prepare(decoder, *optimizers, *scalers))
+        self.decoder = results.pop(0)
+        for opt_ind in range(len(optimizers)):
+            setattr(self, f'optim{opt_ind}', results.pop(0))
+        for scaler_ind in range(len(scalers)):
+            setattr(self, f'scaler{scaler_ind}', results.pop(0))
 
     def state_dict(self, **kwargs):
         trainer_state_dict = super().state_dict(**kwargs)
@@ -441,14 +455,14 @@ class DecoderTrainer(nn.Module):
 
         assert exists(unet_number) and 1 <= unet_number <= self.num_unets
         index = unet_number - 1
-        unet = self.decoder.unets[index]
+        # unet = self.decoder.unets[index]
 
         optimizer = getattr(self, f'optim{index}')
         scaler = getattr(self, f'scaler{index}')
 
-        if exists(self.max_grad_norm):
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(unet.parameters(), self.max_grad_norm)
+        # if exists(self.max_grad_norm):
+        #     scaler.unscale_(optimizer)
+        #     nn.utils.clip_grad_norm_(unet.parameters(), self.max_grad_norm)
 
         scaler.step(optimizer)
         scaler.update()
@@ -464,15 +478,16 @@ class DecoderTrainer(nn.Module):
     @cast_torch_tensor
     @decoder_sample_in_chunks
     def sample(self, *args, **kwargs):
+        distributed = self.accelerator.num_processes > 1
         if kwargs.pop('use_non_ema', False) or not self.use_ema:
-            return self.decoder.sample(*args, **kwargs)
+            return self.accelerator.unwrap_model(self.decoder).sample(*args, **kwargs, distributed = distributed)
 
         trainable_unets = self.decoder.unets
-        self.decoder.unets = self.unets                  # swap in exponential moving averaged unets for sampling
+        self.accelerator.unwrap_model(self.decoder).unets = self.unets                  # swap in exponential moving averaged unets for sampling
 
-        output = self.decoder.sample(*args, **kwargs)
+        output = self.accelerator.unwrap_model(self.decoder).sample(*args, **kwargs, distributed = distributed)
 
-        self.decoder.unets = trainable_unets             # restore original training unets
+        self.accelerator.unwrap_model(self.decoder).unets = trainable_unets             # restore original training unets
 
         # cast the ema_model unets back to original device
         for ema in self.ema_unets:
@@ -501,6 +516,6 @@ class DecoderTrainer(nn.Module):
             total_loss += loss.item()
 
             if self.training:
-                self.scale(loss, unet_number = unet_number).backward()
+                self.accelerator.backward(self.scale(loss, unet_number = unet_number))
 
         return total_loss
