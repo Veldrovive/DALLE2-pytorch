@@ -14,6 +14,7 @@ from torchmetrics.image.inception import InceptionScore
 from torchmetrics.image.kid import KernelInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import reduce
 import webdataset as wds
 import click
 
@@ -238,15 +239,7 @@ def train(
     """
     Trains a decoder on a dataset.
     """
-    is_master = accelerator.state.process_index == 0
-    is_local_master = accelerator.state.local_process_index == 0
-    def if_master(fn):
-        def wrapper(*args, **kwargs):
-            if is_master:
-                return fn(*args, **kwargs)
-        return wrapper
-
-    print(f"I am rank {accelerator.state.process_index} in a world size of {accelerator.state.num_processes}. I am {'local' if is_local_master else 'not local'} master. I am {'master' if is_master else 'not master'}")
+    is_master = accelerator.process_index == 0
 
     trainer = DecoderTrainer(  # TODO: Change the get_optimizer function so that it can take arbitrary named args so we can just put **kwargs as an argument here
         accelerator,
@@ -258,6 +251,7 @@ def train(
     start_step = 0
     start_epoch = 0
     validation_losses = []
+    log_interval = 20
 
     if load_config is not None and load_config["source"] is not None:
         start_epoch, start_step, validation_losses = recall_trainer(tracker, trainer, recall_source=load_config["source"], **load_config)
@@ -268,115 +262,131 @@ def train(
         unet_training_mask = [True] * trainer.num_unets
     assert len(unet_training_mask) == trainer.num_unets, f"The unet training mask should be the same length as the number of unets in the decoder. Got {len(unet_training_mask)} and {trainer.num_unets}"
 
-    if_master(print)(print_ribbon("Generating Example Data", repeat=40))
-    if_master(print)("This can take a while to load the shard lists...")
+    accelerator.print(print_ribbon("Generating Example Data", repeat=40))
+    accelerator.print("This can take a while to load the shard lists...")
     if is_master:
         train_example_data = get_example_data(dataloaders["train_sampling"], inference_device, n_sample_images)
-        # test_example_data = get_example_data(dataloaders["test_sampling"], inference_device, n_sample_images)
+        test_example_data = get_example_data(dataloaders["test_sampling"], inference_device, n_sample_images)
     
     send_to_device = lambda arr: [x.to(device=inference_device, dtype=torch.float) for x in arr]
     step = start_step
+
+    sample_length_tensor = torch.zeros(1, dtype=torch.int, device=inference_device)
+    unet_losses_tensor = torch.zeros(log_interval, trainer.num_unets, dtype=torch.float, device=inference_device)
     for epoch in range(start_epoch, epochs):
-        try:
-            if_master(print)(print_ribbon(f"Starting epoch {epoch}", repeat=40))
-            trainer.train()
+        accelerator.print(print_ribbon(f"Starting epoch {epoch}", repeat=40))
+        trainer.train()
 
-            sample = 0
-            last_sample = 0
-            last_snapshot = 0
+        sample = 0
+        last_sample = 0
+        last_snapshot = 0
+        last_time = time.time()
+        for i, (img, emb) in enumerate(dataloaders["train"]):
+            # We want to count the total number of samples across all processes
+            sample_length_tensor[0] = len(img)
+            all_samples = accelerator.gather(sample_length_tensor)  # TODO: accelerator.reduce is broken when this was written. If it is fixed replace this.
+            total_samples = all_samples.sum().item()
+            step += 1
+            sample += total_samples
+            img, emb = send_to_device((img, emb))
+            
+            for unet in range(1, trainer.num_unets+1):
+                # Check if this is a unet we are training
+                if unet_training_mask[unet-1]: # Unet index is the unet number - 1
+                    loss = trainer.forward(img, image_embed=emb, unet_number=unet)
+                    trainer.update(unet_number=unet)
+                    unet_losses_tensor[i % log_interval, unet-1] = loss
+
+            samples_per_sec = (sample - last_sample) / (time.time() - last_time)
             last_time = time.time()
-            losses = []
-            for i, (img, emb) in enumerate(dataloaders["train"]):
-                step += 1
-                sample += img.shape[0]
-                img, emb = send_to_device((img, emb))
-                
-                for unet in range(1, trainer.num_unets+1):
-                    # Check if this is a unet we are training
-                    if unet_training_mask[unet-1]: # Unet index is the unet number - 1
-                        accelerator.wait_for_everyone()
-                        loss = trainer.forward(img, image_embed=emb, unet_number=unet)
-                        trainer.update(unet_number=unet)
-                        losses.append(loss)
+            last_sample = sample
 
-                samples_per_sec = (sample - last_sample) / (time.time() - last_time)
-                last_time = time.time()
-                last_sample = sample
-
-                if i % 20 == 0:
-                    average_loss = sum(losses) / len(losses)
-                    log_data = {
-                        "Training loss": average_loss,
-                        "Epoch": epoch,
-                        "Sample": sample,
-                        "Step": i,
-                        "Samples per second": samples_per_sec
-                    }
-                    # print(f"I am rank {accelerator.state.process_index}. {log_data}")
-                    # print(f"I am rank {accelerator.state.process_index}. Example weight: {trainer.decoder.state_dict()['module.unets.0.init_conv.convs.0.weight'][0,0,0,0]}")
-                    if is_master:
-                        tracker.log(log_data, step=step, verbose=True)
-                    losses = []
+            if i % log_interval == 0:
+                # We want to average losses across all processes
+                unet_all_losses = accelerator.gather(unet_losses_tensor)
+                mask = unet_all_losses != 0
+                unet_average_loss = (unet_all_losses * mask).sum(dim=0) / mask.sum(dim=0)
+                loss_map = { f"Unet {index} Training Loss": loss.item() for index, loss in enumerate(unet_average_loss) if loss != 0 }
+                log_data = {
+                    "Epoch": epoch,
+                    "Sample": sample,
+                    "Step": i,
+                    "Samples per second": samples_per_sec,
+                    **loss_map
+                }
+                # print(f"I am rank {accelerator.state.process_index}. Example weight: {trainer.decoder.state_dict()['module.unets.0.init_conv.convs.0.weight'][0,0,0,0]}")
+                if is_master:
+                    tracker.log(log_data, step=step, verbose=True)
 
 
-                if is_master and last_snapshot + save_every_n_samples < sample:  # This will miss by some amount every time, but it's not a big deal... I hope
-                    print("Saving snapshot")
-                    last_snapshot = sample
-                    # We need to know where the model should be saved
-                    save_paths = []
-                    if save_latest:
-                        save_paths.append("latest.pth")
-                    if save_all:
-                        save_paths.append(f"checkpoints/epoch_{epoch}_step_{step}.pth")
-                    save_trainer(tracker, trainer, epoch, step, validation_losses, save_paths)
-                    if n_sample_images is not None and n_sample_images > 0:
-                        trainer.eval()
-                        train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
-                        trainer.train()
-                        tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step)
+            if is_master and last_snapshot + save_every_n_samples < sample:  # This will miss by some amount every time, but it's not a big deal... I hope
+                # It is difficult to gather this kind of info on the accelerator, so we have to do it on the master
+                print("Saving snapshot")
+                last_snapshot = sample
+                # We need to know where the model should be saved
+                save_paths = []
+                if save_latest:
+                    save_paths.append("latest.pth")
+                if save_all:
+                    save_paths.append(f"checkpoints/epoch_{epoch}_step_{step}.pth")
+                save_trainer(tracker, trainer, epoch, step, validation_losses, save_paths)
+                if n_sample_images is not None and n_sample_images > 0:
+                    trainer.eval()
+                    train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
+                    trainer.train()
+                    tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step)
 
-                if epoch_samples is not None and sample >= epoch_samples:
-                    break
-        except Exception as e:
-            print(f"Exception in epoch {epoch} on rank {accelerator.state.process_index}")
-            print(e)
-            raise e
+            if epoch_samples is not None and sample >= epoch_samples:
+                break
+
+        trainer.eval()
+        accelerator.print(print_ribbon(f"Starting Validation {epoch}", repeat=40))
+        val_sample = 0
+        val_sample_length_tensor = torch.zeros(1, dtype=torch.int, device=inference_device)
+        average_val_loss_tensor = torch.zeros(1, trainer.num_unets, dtype=torch.float, device=inference_device)
+        last_time = time.time()
+        last_sample = 0
+        for i, (img, emb, txt) in enumerate(dataloaders["val"]):
+            val_sample_length_tensor[0] = len(img)
+            all_samples = accelerator.gather(val_sample_length_tensor)
+            total_samples = all_samples.sum().item()
+            val_sample += total_samples
+            img, emb = send_to_device((img, emb))
+            
+            for unet in range(1, len(decoder.unets)+1):
+                if unet_training_mask[unet-1]:
+                    loss = trainer.forward(img.float(), image_embed=emb.float(), unet_number=unet)
+                    average_val_loss_tensor[0, unet-1] += loss
+
+            samples_per_sec = (val_sample - last_sample) / (time.time() - last_time)
+            last_time = time.time()
+            last_sample = val_sample
+
+            if i % log_interval == 0:
+                accelerator.print(f"Epoch {epoch}/{epochs} Val Step {i} -  Sample {val_sample} - {samples_per_sec:.2f} samples/sec")
+                accelerator.print(f"Loss: {(average_val_loss_tensor / (i+1))}")
+                accelerator.print("")
+
+            if validation_samples is not None and val_sample >= validation_samples:
+                break
+        average_val_loss_tensor /= i+1
+        # Gather all the average loss tensors
+        all_average_val_losses = accelerator.gather(average_val_loss_tensor)
+        if is_master:
+            unet_average_val_loss = all_average_val_losses.mean(dim=0)
+            val_loss_map = { f"Unet {index} Validation Loss": loss.item() for index, loss in enumerate(unet_average_val_loss) if loss != 0 }
+            tracker.log(val_loss_map, step=step, verbose=True)
+
+        # Compute evaluation metrics
+        # We want to do this in a distributed manner so that we can have as many samples as possible since this is slow
+        trainer.eval()
+        if is_master and evaluate_config is not None:
+            print(print_ribbon(f"Starting Evaluation {epoch}", repeat=40))
+            evaluation = evaluate_trainer(trainer, dataloaders["val"], inference_device, **evaluate_config)
+            tracker.log(evaluation, step=step, verbose=True)
 
         if is_master:
-            trainer.eval()
-            print(print_ribbon(f"Starting Validation {epoch}", repeat=40))
-            with torch.no_grad():
-                sample = 0
-                average_loss = 0
-                start_time = time.time()
-                for i, (img, emb, txt) in enumerate(dataloaders["val"]):
-                    sample += img.shape[0]
-                    img, emb = send_to_device((img, emb))
-                    
-                    for unet in range(1, len(decoder.unets)+1):
-                        loss = trainer.forward(img.float(), image_embed=emb.float(), unet_number=unet)
-                        average_loss += loss
-
-                    if i % 10 == 0:
-                        print(f"Epoch {epoch}/{epochs} - {sample / (time.time() - start_time):.2f} samples/sec")
-                        print(f"Loss: {average_loss / (i+1)}")
-                        print("")
-
-                    if validation_samples is not None and sample >= validation_samples:
-                        break
-                average_loss /= i+1
-                log_data = {
-                    "Validation loss": average_loss
-                }
-                tracker.log(log_data, step=step, verbose=True)
-
-            # Compute evaluation metrics
-            trainer.eval()
-            if evaluate_config is not None:
-                print(print_ribbon(f"Starting Evaluation {epoch}", repeat=40))
-                evaluation = evaluate_trainer(trainer, dataloaders["val"], inference_device, **evaluate_config)
-                tracker.log(evaluation, step=step, verbose=True)
-
+            # Only generate examples and save the model if we are the master
             # Generate sample images
             print(print_ribbon(f"Sampling Set {epoch}", repeat=40))
             test_images, test_captions = generate_grid_samples(trainer, test_example_data, "Test: ")
@@ -389,6 +399,7 @@ def train(
             save_paths = []
             if save_latest:
                 save_paths.append("latest.pth")
+            average_loss = all_average_val_losses.mean(dim=0).item()
             if save_best and (len(validation_losses) == 0 or average_loss < min(validation_losses)):
                 save_paths.append("best.pth")
             validation_losses.append(average_loss)
@@ -431,6 +442,7 @@ def initialize_training(config):
     assert shards_per_process > 0, "Not enough shards to split evenly"
     my_shards = all_shards[rank * shards_per_process: (rank + 1) * shards_per_process]
 
+
     dataloaders = create_dataloaders (
         available_shards=my_shards,
         img_preproc = config.get_preprocessing(),
@@ -443,8 +455,8 @@ def initialize_training(config):
 
     decoder = create_decoder(accelerator.state.device, config["decoder"], config["unets"])
     num_parameters = sum(p.numel() for p in decoder.parameters())
-    print(print_ribbon("Loaded Config", repeat=40))
-    print(f"Number of parameters: {num_parameters}")
+    accelerator.print(print_ribbon("Loaded Config", repeat=40))
+    accelerator.print(f"Number of parameters: {num_parameters}")
 
     tracker = create_tracker(config, **config["tracker"]) if rank == 0 else None
 
@@ -521,7 +533,6 @@ class TrainDecoderConfig:
 @click.command()
 @click.option("--config_file", default="./train_decoder_config.json", help="Path to config file")
 def main(config_file):
-    print("Recalling config from {}".format(config_file))
     with open(config_file) as f:
         config = json.load(f)
     config = TrainDecoderConfig(config)
