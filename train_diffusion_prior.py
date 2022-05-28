@@ -1,7 +1,6 @@
 from pathlib import Path
 import click
 import math
-import time
 import numpy as np
 
 import torch
@@ -10,9 +9,10 @@ from torch import nn
 
 from dalle2_pytorch.dataloaders import make_splits
 from dalle2_pytorch import DiffusionPrior, DiffusionPriorNetwork, OpenAIClipAdapter
-from dalle2_pytorch.trainer import DiffusionPriorTrainer, load_diffusion_model, save_diffusion_model, print_ribbon
+from dalle2_pytorch.trainer import DiffusionPriorTrainer, load_diffusion_model, save_diffusion_model
 
 from dalle2_pytorch.trackers import ConsoleTracker, WandbTracker
+from dalle2_pytorch.utils import Timer, print_ribbon
 
 from embedding_reader import EmbeddingReader
 
@@ -28,16 +28,6 @@ tracker = WandbTracker()
 
 def exists(val):
     val is not None
-
-class Timer:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.last_time = time.time()
-
-    def elapsed(self):
-        return time.time() - self.last_time
 
 # functions
 

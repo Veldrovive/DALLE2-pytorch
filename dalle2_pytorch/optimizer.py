@@ -12,6 +12,7 @@ def get_optimizer(
     betas = (0.9, 0.999),
     eps = 1e-8,
     filter_by_requires_grad = False,
+    group_wd_params = True,
     **kwargs
 ):
     if filter_by_requires_grad:
@@ -20,12 +21,12 @@ def get_optimizer(
     if wd == 0:
         return Adam(params, lr = lr, betas = betas, eps = eps)
 
-    params = set(params)
-    wd_params, no_wd_params = separate_weight_decayable_params(params)
+    if group_wd_params:
+        wd_params, no_wd_params = separate_weight_decayable_params(params)
 
-    param_groups = [
-        {'params': list(wd_params)},
-        {'params': list(no_wd_params), 'weight_decay': 0},
-    ]
+        params = [
+            {'params': list(wd_params)},
+            {'params': list(no_wd_params), 'weight_decay': 0},
+        ]
 
-    return AdamW(param_groups, lr = lr, weight_decay = wd, betas = betas, eps = eps)
+    return AdamW(params, lr = lr, weight_decay = wd, betas = betas, eps = eps)

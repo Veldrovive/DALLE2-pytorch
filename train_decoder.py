@@ -1,13 +1,12 @@
+import enum
 from dalle2_pytorch import Unet, Decoder
-from dalle2_pytorch.trainer import DecoderTrainer, print_ribbon
+from dalle2_pytorch.trainer import DecoderTrainer
 from dalle2_pytorch.dataloaders import create_image_embedding_dataloader
 from dalle2_pytorch.trackers import WandbTracker, ConsoleTracker
-from configs.decoder_defaults import default_config, ConfigField
-import time
-import os
-import json
+from dalle2_pytorch.train_configs import TrainDecoderConfig
+from dalle2_pytorch.utils import Timer, print_ribbon
+
 import torchvision
-from torchvision import transforms as T
 import torch
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
@@ -18,6 +17,17 @@ from accelerate.utils import reduce
 import webdataset as wds
 import click
 
+# constants
+
+TRAIN_CALC_LOSS_EVERY_ITERS = 10
+VALID_CALC_LOSS_EVERY_ITERS = 10
+
+# helpers functions
+
+def exists(val):
+    return val is not None
+
+# main functions
 
 def create_dataloaders(
     available_shards,
@@ -78,23 +88,6 @@ def create_dataloaders(
         "test_sampling": test_sampling_dataloader
     }
 
-
-def create_decoder(device, decoder_config, unets_config):
-    """Creates a sample decoder"""
-    unets = []
-    for i in range(0, len(unets_config)):
-        unets.append(Unet(
-            **unets_config[i]
-        ))
-    
-    decoder = Decoder(
-        unet=tuple(unets),  # Must be tuple because of cast_tuple
-        **decoder_config
-    )
-    decoder.to(device=device)
-
-    return decoder
-
 def get_dataset_keys(dataloader):
     """
     It is sometimes neccesary to get the keys the dataloader is returning. Since the dataset is burried in the dataloader, we need to do a process to recover it.
@@ -149,33 +142,33 @@ def generate_grid_samples(trainer, examples, text_prepend=""):
     grid_images = [torchvision.utils.make_grid([original_image, generated_image]) for original_image, generated_image in zip(real_images, generated_images)]
     return grid_images, captions
                     
-def evaluate_trainer(trainer, dataloader, device, n_evalation_samples=1000, FID=None, IS=None, KID=None, LPIPS=None):
+def evaluate_trainer(trainer, dataloader, device, n_evaluation_samples=1000, FID=None, IS=None, KID=None, LPIPS=None):
     """
     Computes evaluation metrics for the decoder
     """
     metrics = {}
     # Prepare the data
-    examples = get_example_data(dataloader, device, n_evalation_samples)
+    examples = get_example_data(dataloader, device, n_evaluation_samples)
     real_images, generated_images, captions = generate_samples(trainer, examples)
     real_images = torch.stack(real_images).to(device=device, dtype=torch.float)
     generated_images = torch.stack(generated_images).to(device=device, dtype=torch.float)
     # Convert from [0, 1] to [0, 255] and from torch.float to torch.uint8
     int_real_images = real_images.mul(255).add(0.5).clamp(0, 255).type(torch.uint8)
     int_generated_images = generated_images.mul(255).add(0.5).clamp(0, 255).type(torch.uint8)
-    if FID is not None:
+    if exists(FID):
         fid = FrechetInceptionDistance(**FID)
         fid.to(device=device)
         fid.update(int_real_images, real=True)
         fid.update(int_generated_images, real=False)
         metrics["FID"] = fid.compute().item()
-    if IS is not None:
+    if exists(IS):
         inception = InceptionScore(**IS)
         inception.to(device=device)
         inception.update(int_real_images)
         is_mean, is_std = inception.compute()
         metrics["IS_mean"] = is_mean.item()
         metrics["IS_std"] = is_std.item()
-    if KID is not None:
+    if exists(KID):
         kernel_inception = KernelInceptionDistance(**KID)
         kernel_inception.to(device=device)
         kernel_inception.update(int_real_images, real=True)
@@ -183,7 +176,7 @@ def evaluate_trainer(trainer, dataloader, device, n_evalation_samples=1000, FID=
         kid_mean, kid_std = kernel_inception.compute()
         metrics["KID_mean"] = kid_mean.item()
         metrics["KID_std"] = kid_std.item()
-    if LPIPS is not None:
+    if exists(LPIPS):
         # Convert from [0, 1] to [-1, 1]
         renorm_real_images = real_images.mul(2).sub(1)
         renorm_generated_images = generated_images.mul(2).sub(1)
@@ -241,7 +234,7 @@ def train(
     """
     is_master = accelerator.process_index == 0
 
-    trainer = DecoderTrainer(  # TODO: Change the get_optimizer function so that it can take arbitrary named args so we can just put **kwargs as an argument here
+    trainer = DecoderTrainer(
         accelerator,
         decoder,
         **kwargs
@@ -251,13 +244,12 @@ def train(
     start_step = 0
     start_epoch = 0
     validation_losses = []
-    log_interval = 20
 
-    if load_config is not None and load_config["source"] is not None:
-        start_epoch, start_step, validation_losses = recall_trainer(tracker, trainer, recall_source=load_config["source"], **load_config)
+    if exists(load_config) and exists(load_config.source):
+        start_epoch, start_step, validation_losses = recall_trainer(tracker, trainer, recall_source=load_config.source, **load_config.dict())
     trainer.to(device=inference_device)
 
-    if unet_training_mask is None:
+    if not exists(unet_training_mask):
         # Then the unet mask should be true for all unets in the decoder
         unet_training_mask = [True] * trainer.num_unets
     assert len(unet_training_mask) == trainer.num_unets, f"The unet training mask should be the same length as the number of unets in the decoder. Got {len(unet_training_mask)} and {trainer.num_unets}"
@@ -272,15 +264,15 @@ def train(
     step = start_step
 
     sample_length_tensor = torch.zeros(1, dtype=torch.int, device=inference_device)
-    unet_losses_tensor = torch.zeros(log_interval, trainer.num_unets, dtype=torch.float, device=inference_device)
+    unet_losses_tensor = torch.zeros(TRAIN_CALC_LOSS_EVERY_ITERS, trainer.num_unets, dtype=torch.float, device=inference_device)
     for epoch in range(start_epoch, epochs):
         accelerator.print(print_ribbon(f"Starting epoch {epoch}", repeat=40))
-        trainer.train()
 
+        timer = Timer()
         sample = 0
         last_sample = 0
         last_snapshot = 0
-        last_time = time.time()
+
         for i, (img, emb) in enumerate(dataloaders["train"]):
             # We want to count the total number of samples across all processes
             sample_length_tensor[0] = len(img)
@@ -289,19 +281,22 @@ def train(
             step += 1
             sample += total_samples
             img, emb = send_to_device((img, emb))
-            
+
+            trainer.train()
             for unet in range(1, trainer.num_unets+1):
                 # Check if this is a unet we are training
-                if unet_training_mask[unet-1]: # Unet index is the unet number - 1
-                    loss = trainer.forward(img, image_embed=emb, unet_number=unet)
-                    trainer.update(unet_number=unet)
-                    unet_losses_tensor[i % log_interval, unet-1] = loss
+                if not unet_training_mask[unet-1]: # Unet index is the unet number - 1
+                    continue
 
-            samples_per_sec = (sample - last_sample) / (time.time() - last_time)
-            last_time = time.time()
+                loss = trainer.forward(img, image_embed=emb, unet_number=unet)
+                trainer.update(unet_number=unet)
+                unet_losses_tensor[i % TRAIN_CALC_LOSS_EVERY_ITERS, unet-1] = loss
+            
+            samples_per_sec = (sample - last_sample) / timer.elapsed()
+            timer.reset()
             last_sample = sample
 
-            if i % log_interval == 0:
+            if i % TRAIN_CALC_LOSS_EVERY_ITERS == 0:
                 # We want to average losses across all processes
                 unet_all_losses = accelerator.gather(unet_losses_tensor)
                 mask = unet_all_losses != 0
@@ -318,7 +313,6 @@ def train(
                 if is_master:
                     tracker.log(log_data, step=step, verbose=True)
 
-
             if is_master and last_snapshot + save_every_n_samples < sample:  # This will miss by some amount every time, but it's not a big deal... I hope
                 # It is difficult to gather this kind of info on the accelerator, so we have to do it on the master
                 print("Saving snapshot")
@@ -330,43 +324,40 @@ def train(
                 if save_all:
                     save_paths.append(f"checkpoints/epoch_{epoch}_step_{step}.pth")
                 save_trainer(tracker, trainer, epoch, step, validation_losses, save_paths)
-                if n_sample_images is not None and n_sample_images > 0:
+                if exists(n_sample_images) and n_sample_images > 0:
                     trainer.eval()
                     train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
-                    trainer.train()
                     tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step)
-
-            if epoch_samples is not None and sample >= epoch_samples:
-                break
 
         trainer.eval()
         accelerator.print(print_ribbon(f"Starting Validation {epoch}", repeat=40))
         val_sample = 0
+        last_val_sample = 0
         val_sample_length_tensor = torch.zeros(1, dtype=torch.int, device=inference_device)
         average_val_loss_tensor = torch.zeros(1, trainer.num_unets, dtype=torch.float, device=inference_device)
-        last_time = time.time()
-        last_sample = 0
+        timer = Timer()
         for i, (img, emb, txt) in enumerate(dataloaders["val"]):
             val_sample_length_tensor[0] = len(img)
             all_samples = accelerator.gather(val_sample_length_tensor)
             total_samples = all_samples.sum().item()
             val_sample += total_samples
             img, emb = send_to_device((img, emb))
-            
+
             for unet in range(1, len(decoder.unets)+1):
-                if unet_training_mask[unet-1]:
-                    loss = trainer.forward(img.float(), image_embed=emb.float(), unet_number=unet)
-                    average_val_loss_tensor[0, unet-1] += loss
+                if not unet_training_mask[unet-1]: # Unet index is the unet number - 1
+                    continue
 
-            samples_per_sec = (val_sample - last_sample) / (time.time() - last_time)
-            last_time = time.time()
-            last_sample = val_sample
+                loss = trainer.forward(img.float(), image_embed=emb.float(), unet_number=unet)
+                average_val_loss_tensor[0, unet-1] += loss
 
-            if i % log_interval == 0:
+            if i % VALID_CALC_LOSS_EVERY_ITERS == 0:
+                samples_per_sec = (val_sample - last_val_sample) / timer.elapsed()
+                timer.reset()
+                last_val_sample = val_sample
                 accelerator.print(f"Epoch {epoch}/{epochs} Val Step {i} -  Sample {val_sample} - {samples_per_sec:.2f} samples/sec")
                 accelerator.print(f"Loss: {(average_val_loss_tensor / (i+1))}")
                 accelerator.print("")
-
+            
             if validation_samples is not None and val_sample >= validation_samples:
                 break
         average_val_loss_tensor /= i+1
@@ -377,16 +368,13 @@ def train(
             val_loss_map = { f"Unet {index} Validation Loss": loss.item() for index, loss in enumerate(unet_average_val_loss) if loss != 0 }
             tracker.log(val_loss_map, step=step, verbose=True)
 
-        # Compute evaluation metrics
-        # We want to do this in a distributed manner so that we can have as many samples as possible since this is slow
-        trainer.eval()
-        if is_master and evaluate_config is not None:
-            print(print_ribbon(f"Starting Evaluation {epoch}", repeat=40))
-            evaluation = evaluate_trainer(trainer, dataloaders["val"], inference_device, **evaluate_config)
-            tracker.log(evaluation, step=step, verbose=True)
-
         if is_master:
-            # Only generate examples and save the model if we are the master
+            # Only evaluate, generate examples, and save the model if we are the master
+            if exists(evaluate_config):
+                print(print_ribbon(f"Starting Evaluation {epoch}", repeat=40))
+                evaluation = evaluate_trainer(trainer, dataloaders["val"], inference_device, **evaluate_config.dict())
+                tracker.log(evaluation, step=step, verbose=True)
+
             # Generate sample images
             print(print_ribbon(f"Sampling Set {epoch}", repeat=40))
             test_images, test_captions = generate_grid_samples(trainer, test_example_data, "Test: ")
@@ -409,21 +397,25 @@ def create_tracker(config, tracker_type=None, data_path=None, **kwargs):
     """
     Creates a tracker of the specified type and initializes special features based on the full config
     """
-    tracker_config = config["tracker"]
+    tracker_config = config.tracker
     init_config = {}
-    init_config["config"] = config.config
+
+    if exists(tracker_config.init_config):
+        init_config["config"] = tracker_config.init_config
+
     if tracker_type == "console":
         tracker = ConsoleTracker(**init_config)
     elif tracker_type == "wandb":
         # We need to initialize the resume state here
-        load_config = config["load"]
-        if load_config["source"] == "wandb" and load_config["resume"]:
+        load_config = config.load
+        if load_config.source == "wandb" and load_config.resume:
             # Then we are resuming the run load_config["run_path"]
-            run_id = config["resume"]["wandb_run_path"].split("/")[-1]
+            run_id = load_config.run_path.split("/")[-1]
             init_config["id"] = run_id
             init_config["resume"] = "must"
-        init_config["entity"] = tracker_config["wandb_entity"]
-        init_config["project"] = tracker_config["wandb_project"]
+
+        init_config["entity"] = tracker_config.wandb_entity
+        init_config["project"] = tracker_config.wandb_project
         tracker = WandbTracker(data_path)
         tracker.init(**init_config)
     else:
@@ -431,113 +423,54 @@ def create_tracker(config, tracker_type=None, data_path=None, **kwargs):
     return tracker
     
 def initialize_training(config):
+    # Make sure if we are not loading, distributed models are initialized to the same values
     torch.manual_seed(config["seed"] if "seed" in config.config else 0)
+
+    # Set up accelerator for configurable distributed training
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
-
-    all_shards = list(range(config["data"]["start_shard"], config["data"]["end_shard"] + 1))
-    world_size = accelerator.state.num_processes
-    rank = accelerator.state.process_index
+    
+    # Set up data
+    all_shards = list(range(config.data.start_shard, config.data.end_shard + 1))
+    world_size = accelerator.num_processes
+    rank = accelerator.process_index
     shards_per_process = len(all_shards) // world_size
     assert shards_per_process > 0, "Not enough shards to split evenly"
     my_shards = all_shards[rank * shards_per_process: (rank + 1) * shards_per_process]
 
-
     dataloaders = create_dataloaders (
         available_shards=my_shards,
-        img_preproc = config.get_preprocessing(),
-        train_prop = config["data"]["splits"]["train"],
-        val_prop = config["data"]["splits"]["val"],
-        test_prop = config["data"]["splits"]["test"],
-        n_sample_images=config["train"]["n_sample_images"],
-        **config["data"]
+        img_preproc = config.data.img_preproc,
+        train_prop = config.data.splits.train,
+        val_prop = config.data.splits.val,
+        test_prop = config.data.splits.test,
+        n_sample_images=config.train.n_sample_images,
+        **config.data.dict()
     )
 
-    decoder = create_decoder(accelerator.state.device, config["decoder"], config["unets"])
+    # Create the decoder model and print basic info
+    decoder = config.decoder.create()
     num_parameters = sum(p.numel() for p in decoder.parameters())
-    accelerator.print(print_ribbon("Loaded Config", repeat=40))
     accelerator.print(f"Number of parameters: {num_parameters}")
 
-    tracker = create_tracker(config, **config["tracker"]) if rank == 0 else None
+    # Create and initialize the tracker if we are the master
+    tracker = create_tracker(config, **config.tracker.dict()) if rank == 0 else None
 
+    accelerator.print(print_ribbon("Loaded Config", repeat=40))
     train(dataloaders, decoder, accelerator,
         tracker=tracker,
         inference_device=accelerator.state.device,
-        load_config=config["load"],
-        evaluate_config=config["evaluate"],
-        **config["train"],
+        load_config=config.load,
+        evaluate_config=config.evaluate,
+        **config.train.dict(),
     )
-
-
-class TrainDecoderConfig:
-    def __init__(self, config):
-        self.config = self.map_config(config, default_config)
-
-    def map_config(self, config, defaults):
-        """
-        Returns a dictionary containing all config options in the union of config and defaults.
-        If the config value is an array, apply the default value to each element.
-        If the default values dict has a value of ConfigField.REQUIRED for a key, it is required and a runtime error should be thrown if a value is not supplied from config
-        """
-        def _check_option(option, option_config, option_defaults):
-            for key, value in option_defaults.items():
-                if key not in option_config:
-                    if value == ConfigField.REQUIRED:
-                        raise RuntimeError("Required config value '{}' of option '{}' not supplied".format(key, option))
-                    option_config[key] = value
-        
-        for key, value in defaults.items():
-            if key not in config:
-                # Then they did not pass in one of the main configs. If the default is an array or object, then we can fill it in. If is a required object, we must error
-                if value == ConfigField.REQUIRED:
-                    raise RuntimeError("Required config value '{}' not supplied".format(key))
-                elif isinstance(value, dict):
-                    config[key] = {}
-                elif isinstance(value, list):
-                    config[key] = [{}]
-            # Config[key] is now either a dict, list of dicts, or an object that cannot be checked. 
-            # If it is a list, then we need to check each element
-            if isinstance(value, list):
-                assert isinstance(config[key], list)
-                for element in config[key]:
-                    _check_option(key, element, value[0])
-            elif isinstance(value, dict):
-                _check_option(key, config[key], value)
-            # This object does not support checking
-        return config
-
-    def get_preprocessing(self):
-        """
-        Takes the preprocessing dictionary and converts it to a composition of torchvision transforms
-        """
-        def _get_transformation(transformation_name, **kwargs):
-            if transformation_name == "RandomResizedCrop":
-                return T.RandomResizedCrop(**kwargs)
-            elif transformation_name == "RandomHorizontalFlip":
-                return T.RandomHorizontalFlip()
-            elif transformation_name == "ToTensor":
-                return T.ToTensor()
-        
-        transformations = []
-        for transformation_name, transformation_kwargs in self.config["data"]["preprocessing"].items():
-            if isinstance(transformation_kwargs, dict):
-                transformations.append(_get_transformation(transformation_name, **transformation_kwargs))
-            else:
-                transformations.append(_get_transformation(transformation_name))
-        return T.Compose(transformations)
     
-    def __getitem__(self, key):
-        return self.config[key]
-
 # Create a simple click command line interface to load the config and start the training
 @click.command()
 @click.option("--config_file", default="./train_decoder_config.json", help="Path to config file")
 def main(config_file):
-    with open(config_file) as f:
-        config = json.load(f)
-    config = TrainDecoderConfig(config)
+    config = TrainDecoderConfig.from_json_path(config_file)
     initialize_training(config)
-
 
 if __name__ == "__main__":
     main()

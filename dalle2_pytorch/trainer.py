@@ -1,5 +1,6 @@
 import time
 import copy
+from pathlib import Path
 from math import ceil
 from functools import partial, wraps
 from collections.abc import Iterable
@@ -54,6 +55,10 @@ def num_to_groups(num, divisor):
     if remainder > 0:
         arr.append(remainder)
     return arr
+
+def get_pkg_version():
+    from pkg_resources import get_distribution
+    return get_distribution('dalle2_pytorch').version
 
 # decorators
 
@@ -128,12 +133,6 @@ def split_args_and_kwargs(*args, split_size = None, **kwargs):
         chunk_size_frac = chunk_size / batch_size
         yield chunk_size_frac, (chunked_args, chunked_kwargs)
 
-# print helpers
-
-def print_ribbon(s, symbol = '=', repeat = 40):
-    flank = symbol * repeat
-    return f'{flank} {s} {flank}'
-
 # saving and loading functions
 
 # for diffusion prior
@@ -191,7 +190,7 @@ class EMA(nn.Module):
         self.update_after_step = update_after_step  // update_every # only start EMA after this step number, starting at 0
 
         self.register_buffer('initted', torch.Tensor([False]))
-        self.register_buffer('step', torch.tensor([0.]))
+        self.register_buffer('step', torch.tensor([0]))
 
     def restore_ema_model_device(self):
         device = self.initted.device
@@ -255,6 +254,7 @@ class DiffusionPriorTrainer(nn.Module):
         eps = 1e-6,
         max_grad_norm = None,
         amp = False,
+        group_wd_params = True,
         **kwargs
     ):
         super().__init__()
@@ -280,6 +280,7 @@ class DiffusionPriorTrainer(nn.Module):
             lr = lr,
             wd = wd,
             eps = eps,
+            group_wd_params = group_wd_params,
             **kwargs
         )
 
@@ -287,7 +288,50 @@ class DiffusionPriorTrainer(nn.Module):
 
         self.max_grad_norm = max_grad_norm
 
-        self.register_buffer('step', torch.tensor([0.]))
+        self.register_buffer('step', torch.tensor([0]))
+
+    def save(self, path, overwrite = True, **kwargs):
+        path = Path(path)
+        assert not (path.exists() and not overwrite)
+        path.parent.mkdir(parents = True, exist_ok = True)
+
+        save_obj = dict(
+            scaler = self.scaler.state_dict(),
+            optimizer = self.optimizer.state_dict(),
+            model = self.diffusion_prior.state_dict(),
+            version = get_pkg_version(),
+            step = self.step.item(),
+            **kwargs
+        )
+
+        if self.use_ema:
+            save_obj = {**save_obj, 'ema': self.ema_diffusion_prior.state_dict()}
+
+        torch.save(save_obj, str(path))
+
+    def load(self, path, only_model = False, strict = True):
+        path = Path(path)
+        assert path.exists()
+
+        loaded_obj = torch.load(str(path))
+
+        if get_pkg_version() != loaded_obj['version']:
+            print(f'loading saved diffusion prior at version {loaded_obj["version"]} but current package version is at {get_pkg_version()}')
+
+        self.diffusion_prior.load_state_dict(loaded_obj['model'], strict = strict)
+        self.step.copy_(torch.ones_like(self.step) * loaded_obj['step'])
+
+        if only_model:
+            return loaded_obj
+
+        self.scaler.load_state_dict(loaded_obj['scaler'])
+        self.optimizer.load_state_dict(loaded_obj['optimizer'])
+
+        if self.use_ema:
+            assert 'ema' in loaded_obj
+            self.ema_diffusion_prior.load_state_dict(loaded_obj['ema'], strict = strict)
+
+        return loaded_obj
 
     def update(self):
         if exists(self.max_grad_norm):
@@ -369,6 +413,7 @@ class DecoderTrainer(nn.Module):
         eps = 1e-8,
         max_grad_norm = 0.5,
         amp = False,
+        group_wd_params = True,
         **kwargs
     ):
         super().__init__()
@@ -397,6 +442,7 @@ class DecoderTrainer(nn.Module):
                 lr = unet_lr,
                 wd = unet_wd,
                 eps = unet_eps,
+                group_wd_params = group_wd_params,
                 **kwargs
             )
 
@@ -410,25 +456,62 @@ class DecoderTrainer(nn.Module):
         self.max_grad_norm = max_grad_norm
 
         self.register_buffer('step', torch.tensor([0.]))
-
         results = list(self.accelerator.prepare(decoder, *optimizers))
         self.decoder = results.pop(0)
         for opt_ind in range(len(optimizers)):
             setattr(self, f'optim{opt_ind}', results.pop(0))
 
-    def state_dict(self, **kwargs):
-        trainer_state_dict = super().state_dict(**kwargs)
-        state_dict = {}
-        state_dict["trainer"] = trainer_state_dict
-        for index in range(self.num_unets):
-            state_dict[f'optim{index}'] = getattr(self, f'optim{index}').state_dict()
-        return state_dict
+    def save(self, path, overwrite = True, **kwargs):
+        path = Path(path)
+        assert not (path.exists() and not overwrite)
+        path.parent.mkdir(parents = True, exist_ok = True)
 
-    def load_state_dict(self, state_dict, **kwargs):
-        super().load_state_dict(state_dict["trainer"], **kwargs)
-        for index in range(self.num_unets):
-            getattr(self, f'optim{index}').load_state_dict(state_dict[f'optim{index}'])
-            getattr(self, f'scaler{index}').load_state_dict(state_dict[f'scaler{index}'])
+        save_obj = dict(
+            model = self.accelerator.unwrap(self.decoder).state_dict(),
+            version = get_pkg_version(),
+            step = self.step.item(),
+            **kwargs
+        )
+
+        for ind in range(0, self.num_unets):
+            optimizer_key = f'scaler{ind}'
+            optimizer = getattr(self, optimizer_key)
+            save_obj = {**save_obj, optimizer_key: self.accelerator.unwrap(optimizer).state_dict()}
+
+        if self.use_ema:
+            save_obj = {**save_obj, 'ema': self.ema_unets.state_dict()}
+
+        self.accelerator.save(save_obj, str(path))
+
+    def load(self, path, only_model = False, strict = True):
+        path = Path(path)
+        assert path.exists()
+
+        loaded_obj = torch.load(str(path))
+
+        if get_pkg_version() != loaded_obj['version']:
+            print(f'loading saved decoder at version {loaded_obj["version"]}, but current package version is {get_pkg_version()}')
+
+        self.decoder.load_state_dict(loaded_obj['model'], strict = strict)
+        self.step.copy_(torch.ones_like(self.step) * loaded_obj['step'])
+
+        if only_model:
+            return loaded_obj
+
+        for ind in range(0, self.num_unets):
+            scaler_key = f'scaler{ind}'
+            optimizer_key = f'scaler{ind}'
+            scaler = getattr(self, scaler_key)
+            optimizer = getattr(self, optimizer_key)
+
+            scaler.load_state_dict(loaded_obj[scaler_key])
+            optimizer.load_state_dict(loaded_obj[optimizer_key])
+
+        if self.use_ema:
+            assert 'ema' in loaded_obj
+            self.ema_unets.load_state_dict(loaded_obj['ema'], strict = strict)
+
+        return loaded_obj
 
     @property
     def unets(self):

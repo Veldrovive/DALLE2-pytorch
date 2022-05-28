@@ -59,6 +59,9 @@ def default(val, d):
     return d() if isfunction(d) else d
 
 def cast_tuple(val, length = 1):
+    if isinstance(val, list):
+        val = tuple(val)
+
     return val if isinstance(val, tuple) else ((val,) * length)
 
 def module_device(module):
@@ -887,6 +890,8 @@ class DiffusionPrior(BaseGaussianDiffusion):
         )
 
         if exists(clip):
+            assert image_channels == clip.image_channels, f'channels of image ({image_channels}) should be equal to the channels that CLIP accepts ({clip.image_channels})'
+
             if isinstance(clip, CLIP):
                 clip = XClipAdapter(clip, **clip_adapter_overrides)
             elif isinstance(clip, CoCa):
@@ -1102,13 +1107,20 @@ class Block(nn.Module):
         groups = 8
     ):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(dim, dim_out, 3, padding = 1),
-            nn.GroupNorm(groups, dim_out),
-            nn.SiLU()
-        )
-    def forward(self, x):
-        return self.block(x)
+        self.project = nn.Conv2d(dim, dim_out, 3, padding = 1)
+        self.norm = nn.GroupNorm(groups, dim_out)
+        self.act = nn.SiLU()
+
+    def forward(self, x, scale_shift = None):
+        x = self.project(x)
+        x = self.norm(x)
+
+        if exists(scale_shift):
+            scale, shift = scale_shift
+            x = x * (scale + 1) + shift
+
+        x = self.act(x)
+        return x
 
 class ResnetBlock(nn.Module):
     def __init__(
@@ -1127,7 +1139,7 @@ class ResnetBlock(nn.Module):
         if exists(time_cond_dim):
             self.time_mlp = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(time_cond_dim, dim_out)
+                nn.Linear(time_cond_dim, dim_out * 2)
             )
 
         self.cross_attn = None
@@ -1147,11 +1159,14 @@ class ResnetBlock(nn.Module):
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, cond = None, time_emb = None):
-        h = self.block1(x)
 
+        scale_shift = None
         if exists(self.time_mlp) and exists(time_emb):
             time_emb = self.time_mlp(time_emb)
-            h = rearrange(time_emb, 'b c -> b c 1 1') + h
+            time_emb = rearrange(time_emb, 'b c -> b c 1 1')
+            scale_shift = time_emb.chunk(2, dim = 1)
+
+        h = self.block1(x, scale_shift = scale_shift)
 
         if exists(self.cross_attn):
             assert exists(cond)
@@ -1331,6 +1346,7 @@ class Unet(nn.Module):
         init_dim = None,
         init_conv_kernel_size = 7,
         resnet_groups = 8,
+        num_resnet_blocks = 1,
         init_cross_embed_kernel_sizes = (3, 7, 15),
         cross_embed_downsample = False,
         cross_embed_downsample_kernel_sizes = (2, 4),
@@ -1416,6 +1432,7 @@ class Unet(nn.Module):
         # resnet block klass
 
         resnet_groups = cast_tuple(resnet_groups, len(in_out))
+        num_resnet_blocks = cast_tuple(num_resnet_blocks, len(in_out))
 
         assert len(resnet_groups) == len(in_out)
 
@@ -1431,7 +1448,7 @@ class Unet(nn.Module):
         self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
 
-        for ind, ((dim_in, dim_out), groups) in enumerate(zip(in_out, resnet_groups)):
+        for ind, ((dim_in, dim_out), groups, layer_num_resnet_blocks) in enumerate(zip(in_out, resnet_groups, num_resnet_blocks)):
             is_first = ind == 0
             is_last = ind >= (num_resolutions - 1)
             layer_cond_dim = cond_dim if not is_first else None
@@ -1439,7 +1456,7 @@ class Unet(nn.Module):
             self.downs.append(nn.ModuleList([
                 ResnetBlock(dim_in, dim_out, time_cond_dim = time_cond_dim, groups = groups),
                 Residual(LinearAttention(dim_out, **attn_kwargs)) if sparse_attn else nn.Identity(),
-                ResnetBlock(dim_out, dim_out, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim, groups = groups),
+                nn.ModuleList([ResnetBlock(dim_out, dim_out, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim, groups = groups) for _ in range(layer_num_resnet_blocks)]),
                 downsample_klass(dim_out) if not is_last else nn.Identity()
             ]))
 
@@ -1449,14 +1466,14 @@ class Unet(nn.Module):
         self.mid_attn = EinopsToAndFrom('b c h w', 'b (h w) c', Residual(Attention(mid_dim, **attn_kwargs))) if attend_at_middle else None
         self.mid_block2 = ResnetBlock(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1])
 
-        for ind, ((dim_in, dim_out), groups) in enumerate(zip(reversed(in_out[1:]), reversed(resnet_groups))):
+        for ind, ((dim_in, dim_out), groups, layer_num_resnet_blocks) in enumerate(zip(reversed(in_out[1:]), reversed(resnet_groups), reversed(num_resnet_blocks))):
             is_last = ind >= (num_resolutions - 2)
             layer_cond_dim = cond_dim if not is_last else None
 
             self.ups.append(nn.ModuleList([
                 ResnetBlock(dim_out * 2, dim_in, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim, groups = groups),
                 Residual(LinearAttention(dim_in, **attn_kwargs)) if sparse_attn else nn.Identity(),
-                ResnetBlock(dim_in, dim_in, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim, groups = groups),
+                nn.ModuleList([ResnetBlock(dim_in, dim_in, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim, groups = groups)  for _ in range(layer_num_resnet_blocks)]),
                 Upsample(dim_in)
             ]))
 
@@ -1613,10 +1630,13 @@ class Unet(nn.Module):
 
         hiddens = []
 
-        for block1, sparse_attn, block2, downsample in self.downs:
-            x = block1(x, c, t)
+        for init_block, sparse_attn, resnet_blocks, downsample in self.downs:
+            x = init_block(x, c, t)
             x = sparse_attn(x)
-            x = block2(x, c, t)
+
+            for resnet_block in resnet_blocks:
+                x = resnet_block(x, c, t)
+
             hiddens.append(x)
             x = downsample(x)
 
@@ -1627,11 +1647,14 @@ class Unet(nn.Module):
 
         x = self.mid_block2(x, mid_c, t)
 
-        for block1, sparse_attn, block2, upsample in self.ups:
+        for init_block, sparse_attn, resnet_blocks, upsample in self.ups:
             x = torch.cat((x, hiddens.pop()), dim=1)
-            x = block1(x, c, t)
+            x = init_block(x, c, t)
             x = sparse_attn(x)
-            x = block2(x, c, t)
+
+            for resnet_block in resnet_blocks:
+                x = resnet_block(x, c, t)
+
             x = upsample(x)
 
         return self.final_conv(x)
@@ -1699,6 +1722,8 @@ class Decoder(BaseGaussianDiffusion):
         vb_loss_weight = 0.001,
         unconditional = False,
         auto_normalize_img = True,                  # whether to take care of normalizing the image from [0, 1] to [-1, 1] and back automatically - you can turn this off if you want to pass in the [-1, 1] ranged image yourself from the dataloader
+        use_dynamic_thres = False,                  # from the Imagen paper
+        dynamic_thres_percentile = 0.9
     ):
         super().__init__(
             beta_schedule = beta_schedule,
@@ -1707,12 +1732,19 @@ class Decoder(BaseGaussianDiffusion):
         )
 
         self.unconditional = unconditional
-        assert not (condition_on_text_encodings and unconditional), 'unconditional decoder image generation cannot be set to True if conditioning on text is present'
 
-        assert self.unconditional or (exists(clip) ^ exists(image_size)), 'either CLIP is supplied, or you must give the image_size and channels (usually 3 for RGB)'
+        # text conditioning
+
+        assert not (condition_on_text_encodings and unconditional), 'unconditional decoder image generation cannot be set to True if conditioning on text is present'
+        self.condition_on_text_encodings = condition_on_text_encodings
+
+        # clip
 
         self.clip = None
         if exists(clip):
+            assert not unconditional, 'clip must not be given if doing unconditional image training'
+            assert channels == clip.image_channels, f'channels of image ({channels}) should be equal to the channels that CLIP accepts ({clip.image_channels})'
+
             if isinstance(clip, CLIP):
                 clip = XClipAdapter(clip, **clip_adapter_overrides)
             elif isinstance(clip, CoCa):
@@ -1722,13 +1754,20 @@ class Decoder(BaseGaussianDiffusion):
             assert isinstance(clip, BaseClipAdapter)
 
             self.clip = clip
-            self.clip_image_size = clip.image_size
-            self.channels = clip.image_channels
-        else:
-            self.clip_image_size = image_size
-            self.channels = channels
 
-        self.condition_on_text_encodings = condition_on_text_encodings
+        # determine image size, with image_size and image_sizes taking precedence
+
+        if exists(image_size) or exists(image_sizes):
+            assert exists(image_size) ^ exists(image_sizes), 'only one of image_size or image_sizes must be given'
+            image_size = default(image_size, lambda: image_sizes[-1])
+        elif exists(clip):
+            image_size = clip.image_size
+        else:
+            raise Error('either image_size, image_sizes, or clip must be given to decoder')
+
+        # channels
+
+        self.channels = channels
 
         # automatically take care of ensuring that first unet is unconditional
         # while the rest of the unets are conditioned on the low resolution image produced by previous unet
@@ -1770,7 +1809,7 @@ class Decoder(BaseGaussianDiffusion):
 
         # unet image sizes
 
-        image_sizes = default(image_sizes, (self.clip_image_size,))
+        image_sizes = default(image_sizes, (image_size,))
         image_sizes = tuple(sorted(set(image_sizes)))
 
         assert len(self.unets) == len(image_sizes), f'you did not supply the correct number of u-nets ({len(self.unets)}) for resolutions {image_sizes}'
@@ -1807,7 +1846,13 @@ class Decoder(BaseGaussianDiffusion):
         self.clip_denoised = clip_denoised
         self.clip_x_start = clip_x_start
 
+        # dynamic thresholding settings, if clipping denoised during sampling
+
+        self.use_dynamic_thres = use_dynamic_thres
+        self.dynamic_thres_percentile = dynamic_thres_percentile
+
         # normalize and unnormalize image functions
+
         self.normalize_img = normalize_neg_one_to_one if auto_normalize_img else identity
         self.unnormalize_img = unnormalize_zero_to_one if auto_normalize_img else identity
 
@@ -1848,7 +1893,21 @@ class Decoder(BaseGaussianDiffusion):
             x_recon = self.predict_start_from_noise(x, t = t, noise = pred)
 
         if clip_denoised:
-            x_recon.clamp_(-1., 1.)
+            # s is the threshold amount
+            # static thresholding would just be s = 1
+            s = 1.
+            if self.use_dynamic_thres:
+                s = torch.quantile(
+                    rearrange(x_recon, 'b ... -> b (...)').abs(),
+                    self.dynamic_thres_percentile,
+                    dim = -1
+                )
+
+                s.clamp_(min = 1.)
+                s = s.view(-1, *((1,) * (x_recon.ndim - 1)))
+
+            # clip by threshold, depending on whether static or dynamic
+            x_recon = x_recon.clamp(-s, s) / s
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
 

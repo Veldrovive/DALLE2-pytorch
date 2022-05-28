@@ -12,7 +12,7 @@ This model is SOTA for text-to-image for now.
 
 Please join <a href="https://discord.gg/xBPBXfcFHd"><img alt="Join us on Discord" src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white"></a> if you are interested in helping out with the replication with the <a href="https://laion.ai/">LAION</a> community | <a href="https://www.youtube.com/watch?v=AIOE1l1W0Tw">Yannic Interview</a>
 
-There was enough interest for a <a href="https://github.com/lucidrains/dalle2-jax">Jax version</a>. I will also eventually extend this to <a href="https://github.com/lucidrains/dalle2-video">text to video</a>, once the repository is in a good place.
+As of 5/23/22, it is no longer SOTA. SOTA will be <a href="https://github.com/lucidrains/imagen-pytorch">here</a>. Jax versions as well as text-to-video project will be shifted towards the Imagen architecture, as it is way simpler.
 
 ## Status
 
@@ -23,6 +23,13 @@ There was enough interest for a <a href="https://github.com/lucidrains/dalle2-ja
 <img src="./samples/oxford.png" width="600px" />
 
 *ongoing at 21k steps*
+
+- <a href="https://twitter.com/Buntworthy/status/1529475416775434240?t=0GEge3Kr9I36cjcUVCQUTg">Justin Pinkney</a> successfully trained the diffusion prior in the repository for his CLIP to Stylegan2 text-to-image application
+
+## Pre-Trained Models
+- LAION is training prior models. Checkpoints are available on <a href="https://huggingface.co/zenglishuci/conditioned-prior">🤗huggingface</a> and the training statistics are available on <a href="https://wandb.ai/nousr_laion/conditioned-prior/reports/LAION-DALLE2-PyTorch-Prior--VmlldzoyMDI2OTIx">🐝WANDB</a>.
+- Decoder - <a href="https://wandb.ai/veldrovive/dalle2_train_decoder/runs/jkrtg0so?workspace=user-veldrovive">In-progress test run</a> 🚧
+- DALL-E 2 🚧
 
 ## Install
 
@@ -1034,6 +1041,19 @@ Once built, images will be saved to the same directory the command is invoked
 
 <a href="https://github.com/lucidrains/stylegan2-pytorch">template</a>
 
+## Appreciation
+
+This library would not have gotten to this working state without the help of
+
+- <a href="https://github.com/nousr">Zion</a> and <a href="https://github.com/krish240574">Kumar</a> for the diffusion training script
+- <a href="https://github.com/Veldrovive">Aidan</a> for the decoder training script and dataloaders
+- <a href="https://github.com/rom1504">Romain</a> for the pull request reviews and project management
+- <a href="https://github.com/Ciaohe">He Cao</a> and <a href="https://github.com/xiankgx">xiankgx</a> for the Q&A and for identifying of critical bugs
+- <a href="https://github.com/crowsonkb">Katherine</a> for her advice
+- <a href="https://stability.ai/">Stability AI</a> for the generous sponsorship
+
+... and many others. Thank you! 🙏
+
 ## Todo
 
 - [x] finish off gaussian diffusion class for latent embedding - allow for prediction of epsilon
@@ -1064,21 +1084,22 @@ Once built, images will be saved to the same directory the command is invoked
 - [x] bring in cross-scale embedding from iclr paper https://github.com/lucidrains/vit-pytorch/blob/main/vit_pytorch/crossformer.py#L14
 - [x] cross embed layers for downsampling, as an option
 - [x] use an experimental tracker agnostic setup, as done <a href="https://github.com/lucidrains/tf-bind-transformer#simple-trainer-class-for-fine-tuning">here</a>
+- [x] use pydantic for config drive training
+- [x] for both diffusion prior and decoder, all exponential moving averaged models needs to be saved and restored as well (as well as the step number)
+- [x] offer save / load methods on the trainer classes to automatically take care of state dicts for scalers / optimizers / saving versions and checking for breaking changes
+- [x] allow for creation of diffusion prior model off pydantic config classes - consider the same for tracker configs
 - [ ] become an expert with unets, cleanup unet code, make it fully configurable, port all learnings over to https://github.com/lucidrains/x-unet (test out unet² in ddpm repo) - consider https://github.com/lucidrains/uformer-pytorch attention-based unet
 - [ ] transcribe code to Jax, which lowers the activation energy for distributed training, given access to TPUs
 - [ ] train on a toy task, offer in colab
 - [ ] think about how best to design a declarative training config that handles preencoding for prior and training of multiple networks in decoder
 - [ ] extend diffusion head to use diffusion-gan (potentially using lightweight-gan) to speed up inference
 - [ ] figure out if possible to augment with external memory, as described in https://arxiv.org/abs/2204.11824
-- [ ] test out grid attention in cascading ddpm locally, decide whether to keep or remove
+- [ ] test out grid attention in cascading ddpm locally, decide whether to keep or remove https://arxiv.org/abs/2204.01697
 - [ ] interface out the vqgan-vae so a pretrained one can be pulled off the shelf to validate latent diffusion + DALL-E2
 - [ ] make sure FILIP works with DALL-E2 from x-clip https://arxiv.org/abs/2111.07783
-- [ ] offer save / load methods on the trainer classes to automatically take care of state dicts for scalers / optimizers / saving versions and checking for breaking changes
 - [ ] bring in skip-layer excitatons (from lightweight gan paper) to see if it helps for either decoder of unet or vqgan-vae training
 - [ ] decoder needs one day worth of refactor for tech debt
 - [ ] allow for unet to be able to condition non-cross attention style as well
-- [ ] for all model classes with hyperparameters that changes the network architecture, make it requirement that they must expose a config property, and write a simple function that asserts that it restores the object correctly
-- [ ] for both diffusion prior and decoder, all exponential moving averaged models needs to be saved and restored as well (as well as the step number)
 - [ ] read the paper, figure it out, and build it https://github.com/lucidrains/DALLE2-pytorch/issues/89
 
 ## Citations
@@ -1122,8 +1143,9 @@ Once built, images will be saved to the same directory the command is invoked
 ```bibtex
 @inproceedings{Tu2022MaxViTMV,
     title   = {MaxViT: Multi-Axis Vision Transformer},
-    author  = {Zhe-Wei Tu and Hossein Talebi and Han Zhang and Feng Yang and Peyman Milanfar and Alan Conrad Bovik and Yinxiao Li},
-    year    = {2022}
+    author  = {Zhengzhong Tu and Hossein Talebi and Han Zhang and Feng Yang and Peyman Milanfar and Alan Conrad Bovik and Yinxiao Li},
+    year    = {2022},
+    url     = {https://arxiv.org/abs/2204.01697}
 }
 ```
 
@@ -1174,6 +1196,14 @@ Once built, images will be saved to the same directory the command is invoked
     author  = {Ho, Jonathan and Saharia, Chitwan and Chan, William and Fleet, David J and Norouzi, Mohammad and Salimans, Tim},
     journal = {arXiv preprint arXiv:2106.15282},
     year    = {2021}
+}
+```
+
+```bibtex
+@misc{Saharia2022,
+    title   = {Imagen: unprecedented photorealism × deep level of language understanding},
+    author  = {Chitwan Saharia*, William Chan*, Saurabh Saxena†, Lala Li†, Jay Whang†, Emily Denton, Seyed Kamyar Seyed Ghasemipour, Burcu Karagol Ayan, S. Sara Mahdavi, Rapha Gontijo Lopes, Tim Salimans, Jonathan Ho†, David Fleet†, Mohammad Norouzi*},
+    year    = {2022}
 }
 ```
 
