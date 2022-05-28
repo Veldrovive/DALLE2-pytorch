@@ -328,6 +328,9 @@ def train(
                     trainer.eval()
                     train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
                     tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step)
+            
+            if epoch_samples is not None and sample >= epoch_samples:
+                break
 
         trainer.eval()
         accelerator.print(print_ribbon(f"Starting Validation {epoch}", repeat=40))
@@ -345,6 +348,7 @@ def train(
 
             for unet in range(1, len(decoder.unets)+1):
                 if not unet_training_mask[unet-1]: # Unet index is the unet number - 1
+                    # No need to evaluate an unchanging unet
                     continue
 
                 loss = trainer.forward(img.float(), image_embed=emb.float(), unet_number=unet)
@@ -424,7 +428,7 @@ def create_tracker(config, tracker_type=None, data_path=None, **kwargs):
     
 def initialize_training(config):
     # Make sure if we are not loading, distributed models are initialized to the same values
-    torch.manual_seed(config["seed"] if "seed" in config.config else 0)
+    torch.manual_seed(config.seed)
 
     # Set up accelerator for configurable distributed training
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -459,7 +463,7 @@ def initialize_training(config):
     accelerator.print(print_ribbon("Loaded Config", repeat=40))
     train(dataloaders, decoder, accelerator,
         tracker=tracker,
-        inference_device=accelerator.state.device,
+        inference_device=accelerator.device,
         load_config=config.load,
         evaluate_config=config.evaluate,
         **config.train.dict(),
