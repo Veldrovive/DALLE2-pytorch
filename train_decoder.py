@@ -570,6 +570,25 @@ def initialize_training(config, config_path):
         else:
             raise ValueError("No text embeddings source specified")
 
+    has_img_embeddings = config.data.img_embeddings_url is not None
+    has_text_embeddings = config.data.text_embeddings_url is not None
+    conditioning_on_text = config.decoder.condition_on_text_encodings
+    has_clip_model = config.decoder.clip is not None
+    data_source_string = ""
+    if has_img_embeddings:
+        data_source_string += "precomputed image embeddings"
+    elif has_clip_model:
+        data_source_string += "clip image embeddings generation"
+    else:
+        raise ValueError("No image embeddings source specified")
+    if conditioning_on_text:
+        if has_text_embeddings:
+            data_source_string += " and precomputed text embeddings"
+        elif has_clip_model:
+            data_source_string += " and clip text encoding generation"
+        else:
+            raise ValueError("No text embeddings source specified")
+
     accelerator.print(print_ribbon("Loaded Config", repeat=40))
     accelerator.print(f"Running training with {accelerator.num_processes} processes and {accelerator.distributed_type} distributed training")
     accelerator.print(f"Training using {data_source_string}. {'conditioned on text' if conditioning_on_text else 'not conditioned on text'}")
