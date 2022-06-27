@@ -11,6 +11,7 @@ from clip import tokenize
 
 import torchvision
 import torch
+from torch import nn
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
 from torchmetrics.image.kid import KernelInceptionDistance
@@ -283,6 +284,21 @@ def train(
     """
     is_master = accelerator.process_index == 0
 
+    if not exists(unet_training_mask):
+        # Then the unet mask should be true for all unets in the decoder
+        unet_training_mask = [True] * len(decoder.unets)
+    assert len(unet_training_mask) == len(decoder.unets), f"The unet training mask should be the same length as the number of unets in the decoder. Got {len(unet_training_mask)} and {trainer.num_unets}"
+    trainable_unet_numbers = [i+1 for i, trainable in enumerate(unet_training_mask) if trainable]
+    first_trainable_unet = trainable_unet_numbers[0]
+    last_trainable_unet = trainable_unet_numbers[-1]
+    def move_unets(unet_training_mask):
+        for i in range(len(decoder.unets)):
+            if not unet_training_mask[i]:
+                # Replace the unet from the module list with a nn.Identity(). This training script never uses unets that aren't being trained so this is fine.
+                decoder.unets[i] = nn.Identity().to(inference_device)
+    # Remove non-trainable unets
+    move_unets(unet_training_mask)
+
     trainer = DecoderTrainer(
         decoder=decoder,
         accelerator=accelerator,
@@ -307,24 +323,6 @@ def train(
         accelerator.print(f"Loaded model from {type(tracker.loader).__name__} on epoch {start_epoch} having seen {samples_seen} samples with minimum validation loss {min(validation_losses) if len(validation_losses) > 0 else 'N/A'}")
         accelerator.print(f"Starting training from task {next_task} at sample {sample} and validation sample {val_sample}")
     trainer.to(device=inference_device)
-
-    if not exists(unet_training_mask):
-        # Then the unet mask should be true for all unets in the decoder
-        unet_training_mask = [True] * trainer.num_unets
-    assert len(unet_training_mask) == trainer.num_unets, f"The unet training mask should be the same length as the number of unets in the decoder. Got {len(unet_training_mask)} and {trainer.num_unets}"
-    trainable_unet_numbers = [i+1 for i, trainable in enumerate(unet_training_mask) if trainable]
-    first_trainable_unet = trainable_unet_numbers[0]
-    last_trainable_unet = trainable_unet_numbers[-1]
-    def move_unets(unet_training_mask):
-        for i, unet in enumerate(decoder.unets):
-            if unet_training_mask[i]:
-                unet.train()
-                unet.to(inference_device)
-            else:
-                unet.eval()
-                unet.to('cpu')
-    # Move the non-training unets to the cpu
-    move_unets(unet_training_mask)
 
     accelerator.print(print_ribbon("Generating Example Data", repeat=40))
     accelerator.print("This can take a while to load the shard lists...")
@@ -570,7 +568,7 @@ def initialize_training(config, config_path):
     )
 
     # Create the decoder model and print basic info
-    decoder: Decoder = config.decoder.create(training_mask=config.train.unet_training_mask)
+    decoder: Decoder = config.decoder.create()
     num_parameters = sum(p.numel() for p in decoder.parameters())
 
     # Create and initialize the tracker if we are the master
