@@ -234,11 +234,17 @@ class DecoderConfig(BaseModel):
     image_cond_drop_prob: float = 0.1
     text_cond_drop_prob: float = 0.5
 
-    def create(self):
+    def create(self, training_mask=None):
         decoder_kwargs = self.dict()
 
         unet_configs = decoder_kwargs.pop('unets')
-        unets = [Unet(**config) for config in unet_configs]
+        def create_unet(i, unet_config):
+            unet = Unet(**unet_config)
+            if training_mask is not None and not training_mask[i]:
+                unet.eval()
+                unet = unet.to('cpu')
+            return unet
+        unets = [create_unet(i, config) for i, config in enumerate(unet_configs)]
 
         has_clip = exists(decoder_kwargs.pop('clip'))
         clip = None
