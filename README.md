@@ -368,7 +368,8 @@ unet1 = Unet(
     image_embed_dim = 512,
     cond_dim = 128,
     channels = 3,
-    dim_mults=(1, 2, 4, 8)
+    dim_mults=(1, 2, 4, 8),
+    cond_on_text_encodings = True    # set to True for any unets that need to be conditioned on text encodings
 ).cuda()
 
 unet2 = Unet(
@@ -385,8 +386,7 @@ decoder = Decoder(
     clip = clip,
     timesteps = 100,
     image_cond_drop_prob = 0.1,
-    text_cond_drop_prob = 0.5,
-    condition_on_text_encodings = False  # set this to True if you wish to condition on text during training and sampling
+    text_cond_drop_prob = 0.5
 ).cuda()
 
 for unet_number in (1, 2):
@@ -1186,6 +1186,16 @@ Once built, images will be saved to the same directory the command is invoked
     journal = {ArXiv},
     year    = {2022},
     volume  = {abs/2204.00227}
+}
+```
+
+```bibtex
+@article{Saharia2021PaletteID,
+    title   = {Palette: Image-to-Image Diffusion Models},
+    author  = {Chitwan Saharia and William Chan and Huiwen Chang and Chris A. Lee and Jonathan Ho and Tim Salimans and David J. Fleet and Mohammad Norouzi},
+    journal = {ArXiv},
+    year    = {2021},
+    volume  = {abs/2111.05826}
 }
 ```
 

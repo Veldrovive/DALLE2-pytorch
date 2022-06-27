@@ -1359,6 +1359,7 @@ class Unet(nn.Module):
         cross_embed_downsample = False,
         cross_embed_downsample_kernel_sizes = (2, 4),
         memory_efficient = False,
+        scale_skip_connection = False,
         **kwargs
     ):
         super().__init__()
@@ -1439,6 +1440,10 @@ class Unet(nn.Module):
 
         self.max_text_len = max_text_len
         self.null_text_embed = nn.Parameter(torch.randn(1, max_text_len, cond_dim))
+
+        # whether to scale skip connection, adopted in Imagen
+
+        self.skip_connect_scale = 1. if not scale_skip_connection else (2 ** -0.5)
 
         # attention related params
 
@@ -1687,7 +1692,9 @@ class Unet(nn.Module):
         x = self.mid_block2(x, mid_c, t)
 
         for init_block, sparse_attn, resnet_blocks, upsample in self.ups:
-            x = torch.cat((x, hiddens.pop()), dim = 1)
+            skip_connect = hiddens.pop() * self.skip_connect_scale
+
+            x = torch.cat((x, skip_connect), dim = 1)
             x = init_block(x, c, t)
             x = sparse_attn(x)
 
@@ -1817,9 +1824,7 @@ class Decoder(nn.Module):
         unets = cast_tuple(unet)
         num_unets = len(unets)
 
-        self.unconditional = unconditional 
-        self.condition_on_text_encodings = unets[0].cond_on_text_encodings
-        assert not (self.condition_on_text_encodings and unconditional), 'unconditional decoder image generation cannot be set to True if conditioning on text is present'
+        self.unconditional = unconditional
 
         # automatically take care of ensuring that first unet is unconditional
         # while the rest of the unets are conditioned on the low resolution image produced by previous unet
@@ -1863,6 +1868,10 @@ class Decoder(nn.Module):
 
             self.unets.append(one_unet)
             self.vaes.append(one_vae.copy_for_eval())
+
+        # determine from unets whether conditioning on text encoding is needed
+
+        self.condition_on_text_encodings = any([unet.cond_on_text_encodings for unet in self.unets])
 
         # create noise schedulers per unet
 
