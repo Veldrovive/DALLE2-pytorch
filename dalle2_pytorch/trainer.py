@@ -456,16 +456,19 @@ class DecoderTrainer(nn.Module):
         optimizers = []
 
         for unet, unet_lr, unet_wd, unet_eps in zip(decoder.unets, lr, wd, eps):
-            optimizer = get_optimizer(
-                unet.parameters(),
-                lr = unet_lr,
-                wd = unet_wd,
-                eps = unet_eps,
-                group_wd_params = group_wd_params,
-                **kwargs
-            )
+            if isinstance(unet, nn.Identity):
+                optimizers.append(None)
+            else:
+                optimizer = get_optimizer(
+                    unet.parameters(),
+                    lr = unet_lr,
+                    wd = unet_wd,
+                    eps = unet_eps,
+                    group_wd_params = group_wd_params,
+                    **kwargs
+                )
 
-            optimizers.append(optimizer)
+                optimizers.append(optimizer)
 
             if self.use_ema:
                 self.ema_unets.append(EMA(unet, **ema_kwargs))
@@ -498,7 +501,8 @@ class DecoderTrainer(nn.Module):
         for ind in range(0, self.num_unets):
             optimizer_key = f'optim{ind}'
             optimizer = getattr(self, optimizer_key)
-            save_obj = {**save_obj, optimizer_key: self.accelerator.unwrap_model(optimizer).state_dict()}
+            state_dict = optimizer.state_dict() if optimizer is not None else None
+            save_obj = {**save_obj, optimizer_key: state_dict}
 
         if self.use_ema:
             save_obj = {**save_obj, 'ema': self.ema_unets.state_dict()}
@@ -523,8 +527,8 @@ class DecoderTrainer(nn.Module):
         for ind in range(0, self.num_unets):
             optimizer_key = f'optim{ind}'
             optimizer = getattr(self, optimizer_key)
-
-            self.accelerator.unwrap_model(optimizer).load_state_dict(loaded_obj[optimizer_key])
+            if optimizer is not None:
+                optimizer.load_state_dict(loaded_obj[optimizer_key])
 
         if self.use_ema:
             assert 'ema' in loaded_obj
