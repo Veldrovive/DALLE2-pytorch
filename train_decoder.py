@@ -549,7 +549,7 @@ def initialize_training(config: TrainDecoderConfig, config_path):
     num_parameters = sum(p.numel() for p in decoder.parameters())
 
     # Create and initialize the tracker if we are the master
-    tracker = create_tracker(accelerator, config, config_path, dummy = rank!=0)
+    tracker = config.tracker.create(config, {}, dummy_mode=not accelerator.is_main_process)
 
     has_img_embeddings = config.data.img_embeddings_url is not None
     has_text_embeddings = config.data.text_embeddings_url is not None
