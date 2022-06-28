@@ -476,13 +476,6 @@ class Tracker:
         self._save_state_dict(trainer, model_path, **kwargs)
         # Call the save methods on the savers
         for saver in self.savers:
-<<<<<<< HEAD
-            try:
-                saver.save(trainer, is_best, is_latest, *args, **kwargs)
-            except Exception as e:
-                self.logger.log_error(f'Error saving checkpoint: {e}', **kwargs)
-                print(f'Error saving checkpoint: {e}')
-=======
             local_path = checkpoint_path if saver.save_type == 'checkpoint' else model_path
             if saver.saving_latest and is_latest:
                 latest_checkpoint_path = saver.save_latest_to.format(**kwargs)
@@ -498,7 +491,6 @@ class Tracker:
                 except Exception as e:
                     self.logger.log_error(f'Error saving checkpoint: {e}', **kwargs)
                     print(f'Error saving checkpoint: {e}')
->>>>>>> flexible_trackers
     
     def recall(self):
         if self.loader is not None:
