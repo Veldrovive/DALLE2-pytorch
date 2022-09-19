@@ -406,7 +406,7 @@ class OpenClipAdapter(BaseClipAdapter):
 
     @property
     def image_size(self):
-        return self.clip.visual.image_size
+        return self.clip.visual.image_size[0]
 
     @property
     def image_channels(self):

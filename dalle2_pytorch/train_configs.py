@@ -13,7 +13,8 @@ from dalle2_pytorch.dalle2_pytorch import (
     Decoder,
     DiffusionPrior,
     DiffusionPriorNetwork,
-    XClipAdapter
+    XClipAdapter,
+    OpenClipAdapter
 )
 from dalle2_pytorch.trackers import Tracker, create_loader, create_logger, create_saver
 
@@ -121,6 +122,8 @@ class AdapterConfig(BaseModel):
             return XClipAdapter(XCLIP(**self.base_model_kwargs))
         elif self.make == "coca":
             return CoCaAdapter(CoCa(**self.base_model_kwargs))
+        elif self.make == "open-clip":
+            return OpenClipAdapter(**self.base_model_kwargs)
         else:
             raise AttributeError("No adapter with that name is available.")
 
@@ -307,6 +310,7 @@ class DecoderTrainConfig(BaseModel):
     wd: SingularOrIterable[float] = 0.01
     warmup_steps: Optional[SingularOrIterable[int]] = None
     find_unused_parameters: bool = True
+    static_graph: bool = False
     max_grad_norm: SingularOrIterable[float] = 0.5
     save_every_n_samples: int = 100000
     n_sample_images: int = 6                       # The number of example images to produce when sampling the train and test dataset

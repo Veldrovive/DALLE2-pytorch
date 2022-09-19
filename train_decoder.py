@@ -556,7 +556,10 @@ def initialize_training(config: TrainDecoderConfig, config_path):
     torch.manual_seed(config.seed)
 
     # Set up accelerator for configurable distributed training
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=config.train.find_unused_parameters)
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=config.train.find_unused_parameters,
+        static_graph=config.train.static_graph
+    )
     init_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=60*60))
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs, init_kwargs])
 
@@ -591,11 +594,16 @@ def initialize_training(config: TrainDecoderConfig, config_path):
 
     # If clip is in the model, we need to remove it for compatibility with deepspeed
     clip = None
+    clip_config = None
     if config.decoder.clip is not None:
         clip = config.decoder.clip.create()  # Of course we keep it to use it during training, just not in the decoder as that causes issues
+        clip_config = config.decoder.clip
         config.decoder.clip = None
     # Create the decoder model and print basic info
     decoder = config.decoder.create()
+    # If we took clip out of the config, put it back in
+    if clip is not None:
+        config.decoder.clip = clip_config
     get_num_parameters = lambda model, only_training=False: sum(p.numel() for p in model.parameters() if (p.requires_grad or not only_training))
 
     # Create and initialize the tracker if we are the master
