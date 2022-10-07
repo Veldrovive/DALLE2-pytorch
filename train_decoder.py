@@ -13,6 +13,7 @@ from clip import tokenize
 import torchvision
 import torch
 from torch import nn
+from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
 from torchmetrics.image.kid import KernelInceptionDistance
@@ -280,6 +281,7 @@ def train(
     unet_training_mask=None,
     condition_on_text_encodings=False,
     cond_scale=1.0,
+    profiler=None,
     **kwargs
 ):
     """
@@ -406,6 +408,7 @@ def train(
 
                     # gather decay rate on each UNet
                     ema_decay_list = {f"Unet {index} EMA Decay": ema_unet.get_current_decay() for index, ema_unet in enumerate(trainer.ema_unets) if unet_training_mask[index]}
+                    learning_rate_list = {f"Unet {index} Learning Rate": getattr(trainer, f"sched{index}").get_last_lr()[0] for index, training in enumerate(unet_training_mask) if training}
 
                     log_data = {
                         "Epoch": epoch,
@@ -414,6 +417,7 @@ def train(
                         "Samples per second": samples_per_sec,
                         "Samples Seen": samples_seen,
                         **ema_decay_list,
+                        **learning_rate_list,
                         **loss_map
                     }
 
@@ -433,6 +437,9 @@ def train(
                 
                 if epoch_samples is not None and sample >= epoch_samples:
                     break
+
+                if profiler is not None:
+                    profiler.step()
             next_task = 'val'
             sample = 0
 
@@ -550,6 +557,11 @@ def create_tracker(accelerator: Accelerator, config: TrainDecoderConfig, config_
     tracker.save_config(config_path, config_name='decoder_config.json')
     tracker.add_save_metadata(state_dict_key='config', metadata=config.dict())
     return tracker
+
+def trace_handler(p, accelerator):
+    accelerator.print(f"Rank {accelerator.state.process_index} received trace signal")
+    p.export_chrome_trace("./tmp/trace_" + str(p.step_num) + ".json")
+    tensorboard_trace_handler(p)
     
 def initialize_training(config: TrainDecoderConfig, config_path):
     # Make sure if we are not loading, distributed models are initialized to the same values
@@ -597,6 +609,7 @@ def initialize_training(config: TrainDecoderConfig, config_path):
     clip_config = None
     if config.decoder.clip is not None:
         clip = config.decoder.clip.create()  # Of course we keep it to use it during training, just not in the decoder as that causes issues
+        clip.to(accelerator.device)
         clip_config = config.decoder.clip
         config.decoder.clip = None
     # Create the decoder model and print basic info
@@ -637,14 +650,35 @@ def initialize_training(config: TrainDecoderConfig, config_path):
     for i, unet in enumerate(decoder.unets):
         accelerator.print(f"Unet {i} has {get_num_parameters(unet)} total; {get_num_parameters(unet, only_training=True)} training")
 
-    train(dataloaders, decoder, accelerator,
+    start_training = lambda p=None: train(dataloaders, decoder, accelerator,
         clip=clip,
         tracker=tracker,
         inference_device=accelerator.device,
         evaluate_config=config.evaluate,
         condition_on_text_encodings=conditioning_on_text,
+        profiler=p,
         **config.train.dict(),
     )
+
+    # tracer = lambda p: trace_handler(p, accelerator)
+    tracer = tensorboard_trace_handler('./tmp', worker_name='rank_' + str(rank))
+
+    if config.train.profile:
+        accelerator.print("Profiling enabled")
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(
+                skip_first=30,
+                wait=1,
+                warmup=1,
+                active=2,
+                repeat=1
+            ),
+            on_trace_ready=tracer
+        ) as p:
+            start_training(p)
+    else:
+        start_training()
     
 # Create a simple click command line interface to load the config and start the training
 @click.command()

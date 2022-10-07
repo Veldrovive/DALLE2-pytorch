@@ -323,6 +323,7 @@ class DecoderTrainConfig(BaseModel):
     ema_beta: float = 0.999
     amp: bool = False
     unet_training_mask: ListOrTuple[bool] = None   # If None, use all unets
+    profile: bool = False
 
 class DecoderEvaluateConfig(BaseModel):
     n_evaluation_samples: int = 1000
